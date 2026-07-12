@@ -8,12 +8,12 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"dev-proxy/internal/config"
 	"dev-proxy/internal/cors"
 	devtls "dev-proxy/internal/tls"
+	"dev-proxy/internal/logger"
 	"dev-proxy/internal/proxy"
 	"dev-proxy/internal/router"
 	"dev-proxy/internal/shutdown"
@@ -27,6 +27,13 @@ func main() {
 		log.Fatalf("[dev-proxy] Failed to load configuration: %v", err)
 	}
 
+	// Initialise logger level from config (default "error" = silent).
+	level, err := logger.ParseLevel(cfg.LogLevel)
+	if err != nil {
+		log.Fatalf("[dev-proxy] %v", err)
+	}
+	logger.SetLevel(level)
+
 	cm := devtls.NewCertManager()
 	sm := shutdown.New(5 * time.Second)
 
@@ -35,6 +42,8 @@ func main() {
 
 	servers := startServers(cfg, rt, cm, sm)
 
+	logStartupInfo(cfg, groups)
+
 	w, err := watcher.New(cfg.ConfigPath, func() error {
 		newCfg, err := config.Load()
 		if err != nil {
@@ -42,20 +51,35 @@ func main() {
 		}
 		newGroups := buildHostGroups(newCfg)
 		rt = router.New(newGroups)
-		fmt.Println("[dev-proxy] Routes updated")
+		logger.Info("config reloaded")
 		return nil
 	})
 	if err == nil {
 		sm.Register(w.Close)
 		if err := w.Start(); err != nil {
-			fmt.Printf("[dev-proxy] Watcher error: %v\n", err)
+			logger.Error("watcher: %v", err)
 		}
 	}
 
-	printBanner(cfg, groups)
-
 	sm.Wait()
 	shutdownServers(servers)
+}
+
+// logStartupInfo emits info-level startup summary after servers are bound.
+func logStartupInfo(cfg *config.Config, groups []router.HostGroup) {
+	for _, port := range cfg.Server.ListenPorts {
+		scheme := "http"
+		if isPortTLSEnabled(port, cfg) {
+			scheme = "https"
+		}
+		logger.Info("listening on %s://localhost:%d", scheme, port)
+	}
+
+	totalRoutes := 0
+	for _, g := range groups {
+		totalRoutes += len(g.Routes)
+	}
+	logger.Info("%d host group(s), %d route(s) configured", len(groups), totalRoutes)
 }
 
 // resolveUpstream resolves a route's upstream field to a concrete URL plus
@@ -67,7 +91,6 @@ func resolveUpstream(rc config.RouteConfig, upstreams map[string]config.Upstream
 	}
 	up, ok := upstreams[rc.Upstream]
 	if !ok {
-		// Already validated at startup; this is a safety fallback.
 		log.Fatalf("[dev-proxy] unknown upstream %q (should have been caught at startup)", rc.Upstream)
 	}
 	return up.URL, up.RewriteHost, up.Insecure
@@ -126,7 +149,6 @@ func buildHostGroups(cfg *config.Config) []router.HostGroup {
 		return groups
 	}
 
-	// Flat routes — wrap in catch-all host group.
 	var routes []router.MatchedRoute
 	for i, rc := range cfg.Routes {
 		routes = append(routes, buildMatchedRoute(i, rc, cfg.Upstreams))
@@ -177,14 +199,12 @@ func startServers(cfg *config.Config, rt *router.Router, cm *devtls.CertManager,
 			srv.TLSConfig = tlsCfg
 
 			go func(p int) {
-				fmt.Printf("[dev-proxy] Listening on https://localhost%s\n", addr)
 				if err := srv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
 					handlePortError(p, err)
 				}
 			}(port)
 		} else {
 			go func(p int) {
-				fmt.Printf("[dev-proxy] Listening on http://localhost%s\n", addr)
 				if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 					handlePortError(p, err)
 				}
@@ -223,13 +243,48 @@ func handlePortError(port int, err error) {
 	log.Fatalf("[dev-proxy] FATAL: server on port %d error: %v", port, err)
 }
 
+// computeUpstreamURL reconstructs the URL that the proxy Director will forward
+// to, applying the same path-rewriting logic as proxy.NewReverseProxy.
+func computeUpstreamURL(route *router.MatchedRoute, reqPath string) string {
+	if route.UpstreamPath != "" {
+		suffix := strings.TrimPrefix(reqPath, route.PathPrefix)
+		if !strings.HasPrefix(suffix, "/") {
+			suffix = "/" + suffix
+		}
+		return route.Upstream + route.UpstreamPath + suffix
+	}
+	return route.Upstream + reqPath
+}
+
+// routeCriterion returns a compact tag for the most-specific active path
+// criterion on a route: regex > exact > prefix > "*".
+func routeCriterion(route *router.MatchedRoute) string {
+	if route.PathRegex != nil {
+		return "regex:" + route.PathRegex.String()
+	}
+	if route.PathExact != "" {
+		return "exact:" + route.PathExact
+	}
+	if route.PathPrefix != "" {
+		return "prefix:" + route.PathPrefix
+	}
+	return "*"
+}
+
 func buildHandler(rt *router.Router, serverCfg *config.ServerConfig, isTLS bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		route := rt.Match(r)
-		if route == nil {
-			router.HandleNoMatch(w, r)
+		start := time.Now()
+		result := rt.Match(r)
+
+		if result == nil {
+			lw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusGatewayTimeout}
+			router.HandleNoMatch(lw, r)
+			logger.Debug("%s %s host=%s group=- route=- upstream=- status=%d duration=%v",
+				r.Method, r.URL.Path, r.Host, lw.statusCode, time.Since(start))
 			return
 		}
+
+		route := result.Route
 
 		var handler http.Handler
 
@@ -244,7 +299,10 @@ func buildHandler(rt *router.Router, serverCfg *config.ServerConfig, isTLS bool)
 		}
 
 		if handler == nil {
-			router.HandleNoMatch(w, r)
+			lw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusGatewayTimeout}
+			router.HandleNoMatch(lw, r)
+			logger.Debug("%s %s host=%s group=- route=- upstream=- status=%d duration=%v",
+				r.Method, r.URL.Path, r.Host, lw.statusCode, time.Since(start))
 			return
 		}
 
@@ -263,7 +321,7 @@ func buildHandler(rt *router.Router, serverCfg *config.ServerConfig, isTLS bool)
 			}
 		}
 
-		loggingMiddleware(handler, route).ServeHTTP(w, r)
+		loggingMiddleware(handler, route, result.HostGroupPattern, start).ServeHTTP(w, r)
 	})
 }
 
@@ -288,19 +346,20 @@ func redirectMiddleware(next http.Handler, targetPort int) http.Handler {
 	})
 }
 
-func loggingMiddleware(next http.Handler, route *router.MatchedRoute) http.Handler {
+func loggingMiddleware(next http.Handler, route *router.MatchedRoute, hostGroupPattern string, start time.Time) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
 		lw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(lw, r)
-		duration := time.Since(start)
 
-		upstream := route.Upstream
-		if upstream == "" {
-			upstream = "static:" + route.StaticDir
-		}
-		fmt.Printf("[%s] %s %s → %s (%d) %v\n",
-			r.Method, r.URL.Path, r.Host, upstream, lw.statusCode, duration)
+		upstreamURL := computeUpstreamURL(route, r.URL.Path)
+		logger.Debug("%s %s host=%s group=%s route=%s upstream=%s upstream_url=%s status=%d duration=%v",
+			r.Method, r.URL.Path, r.Host,
+			hostGroupPattern,
+			routeCriterion(route),
+			route.Upstream,
+			upstreamURL,
+			lw.statusCode,
+			time.Since(start))
 	})
 }
 
@@ -314,48 +373,12 @@ func (lw *loggingResponseWriter) WriteHeader(code int) {
 	lw.ResponseWriter.WriteHeader(code)
 }
 
-func printBanner(cfg *config.Config, groups []router.HostGroup) {
-	fmt.Println()
-	fmt.Println("  ┌─────────────────────────────────────┐")
-	fmt.Println("  │         dev-proxy v0.1.0            │")
-	fmt.Println("  ├─────────────────────────────────────┤")
-
-	for _, port := range cfg.Server.ListenPorts {
-		scheme := "http"
-		if isPortTLSEnabled(port, cfg) {
-			scheme = "https"
-		}
-		for _, g := range groups {
-			for _, r := range g.Routes {
-				target := r.Upstream
-				if target == "" {
-					target = "static:" + r.StaticDir
-				}
-				prefix := r.PathPrefix
-				if prefix == "" {
-					prefix = r.PathExact
-				}
-				fmt.Printf("  │  %s://localhost:%d%s [host:%s] → %s\n",
-					scheme, port, prefix, g.Match, target)
-			}
-		}
-	}
-
-	fmt.Println("  └─────────────────────────────────────┘")
-	fmt.Println()
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	wg.Done()
-}
-
 func shutdownServers(servers map[int]*http.Server) {
 	for port, srv := range servers {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
-			fmt.Printf("[dev-proxy] Error shutting down server on port %d: %v\n", port, err)
+			logger.Error("shutting down server on port %d: %v", port, err)
 		}
-		fmt.Printf("[dev-proxy] Server on port %d stopped\n", port)
 	}
 }

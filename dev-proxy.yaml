@@ -1,13 +1,17 @@
 # dev-proxy test configuration
 # Run with: go run ./cmd/dev-proxy/ -config dev-proxy.yaml
 
+# Log level: error (default, silent) | info (startup summary) | debug (per-request trace)
+# log_level: error
+log_level: debug
+
 server:
   listen_ports: [8080, 8443]
   tls:
     enabled: true
     # cert_file: ./certs/cert.pem   # omit to auto-generate a self-signed cert
     # key_file:  ./certs/key.pem
-  redirect_http: true              # http://localhost:8080 → https://localhost:8443
+  redirect_http: true # http://localhost:8080 → https://localhost:8443
 
 # Named upstream definitions — referenced by routes below.
 upstreams:
@@ -35,12 +39,12 @@ hosts:
       # Regex path — /api/v1/... forwards to api-v1 with path rewrite
       - path_regex: "^/api/v1/"
         upstream: api-v1
-        upstream_path: "/v1"        # /api/v1/users → forwarded as /v1/users
+        upstream_path: "/v1" # /api/v1/users → forwarded as /v1/users
 
       # Prefix path — /api/v2/... forwards to api-v2 with path rewrite
       - path_prefix: "/api/v2"
         upstream: api-v2
-        upstream_path: "/v2"        # /api/v2/orders → forwarded as /v2/orders
+        upstream_path: "/v2" # /api/v2/orders → forwarded as /v2/orders
 
       # Catch-all for this host
       - path_prefix: "/"
@@ -55,5 +59,5 @@ hosts:
     routes:
       # Inline URL — backward-compatible syntax still works
       - path_prefix: "/"
-        upstream: "http://localhost:3000"
+        upstream: "https://www.baidu.com"
         rewrite_host: true

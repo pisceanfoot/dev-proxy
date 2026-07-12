@@ -57,12 +57,19 @@ func NewFromRoutes(routes []MatchedRoute) *Router {
 	return New([]HostGroup{{Match: "*", Routes: routes}})
 }
 
+// MatchResult carries the outcome of a Router.Match call, including the
+// host group that was selected and the specific route within it.
+type MatchResult struct {
+	HostGroupPattern string // the matched HostGroup's Match field, e.g. "api.local"
+	Route            *MatchedRoute
+}
+
 // Match performs two-phase matching:
 //  1. Find the first HostGroup whose Match pattern fits req.Host.
 //  2. Within that group, find the first route where all path criteria pass.
 //
 // Returns nil when no host group or no path matches.
-func (r *Router) Match(req *http.Request) *MatchedRoute {
+func (r *Router) Match(req *http.Request) *MatchResult {
 	for i := range r.hostGroups {
 		group := &r.hostGroups[i]
 
@@ -85,7 +92,7 @@ func (r *Router) Match(req *http.Request) *MatchedRoute {
 				continue
 			}
 
-			return rt
+			return &MatchResult{HostGroupPattern: group.Match, Route: rt}
 		}
 
 		// Host matched but no path matched — 504, no fall-through.

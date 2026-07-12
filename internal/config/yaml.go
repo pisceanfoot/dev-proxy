@@ -55,6 +55,7 @@ type HostGroup struct {
 // Config is the top-level YAML configuration.
 type Config struct {
 	Server     ServerConfig              `yaml:"server"`
+	LogLevel   string                    `yaml:"log_level"`
 	Upstreams  map[string]UpstreamConfig `yaml:"upstreams"`
 	Hosts      []HostGroup               `yaml:"hosts"`
 	Routes     []RouteConfig             `yaml:"routes"`
@@ -97,6 +98,16 @@ func Load() (*Config, error) {
 }
 
 func validate(cfg *Config) error {
+	// Validate log level.
+	if cfg.LogLevel != "" {
+		switch strings.ToLower(strings.TrimSpace(cfg.LogLevel)) {
+		case "error", "info", "debug":
+			// valid
+		default:
+			return fmt.Errorf("invalid log_level %q — must be one of: error, info, debug", cfg.LogLevel)
+		}
+	}
+
 	if len(cfg.Server.ListenPorts) == 0 {
 		return fmt.Errorf("server.listen_ports must have at least one port")
 	}
