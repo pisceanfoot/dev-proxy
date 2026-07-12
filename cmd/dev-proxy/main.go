@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -29,18 +30,18 @@ func main() {
 	cm := devtls.NewCertManager()
 	sm := shutdown.New(5 * time.Second)
 
-	routes := buildRoutes(cfg)
-	rt := router.New(routes)
+	groups := buildHostGroups(cfg)
+	rt := router.New(groups)
 
-	servers := startServers(cfg, routes, rt, cm, sm)
+	servers := startServers(cfg, rt, cm, sm)
 
 	w, err := watcher.New(cfg.ConfigPath, func() error {
 		newCfg, err := config.Load()
 		if err != nil {
 			return err
 		}
-		newRoutes := buildRoutes(newCfg)
-		rt = router.New(newRoutes)
+		newGroups := buildHostGroups(newCfg)
+		rt = router.New(newGroups)
 		fmt.Println("[dev-proxy] Routes updated")
 		return nil
 	})
@@ -51,61 +52,100 @@ func main() {
 		}
 	}
 
-	printBanner(cfg, routes)
+	printBanner(cfg, groups)
 
 	sm.Wait()
 	shutdownServers(servers)
 }
 
-func buildRoutes(cfg *config.Config) []router.MatchedRoute {
-	var matched []router.MatchedRoute
-	for _, rc := range cfg.Routes {
-		corsCfg := &router.CORSConfig{}
-		if rc.CORSAllowOrigin != "" {
-			corsCfg.Enabled = true
-			corsCfg.AllowOrigin = rc.CORSAllowOrigin
-		}
+// resolveUpstream resolves a route's upstream field to a concrete URL plus
+// connection settings. Inline URLs (containing "://") are used as-is; otherwise
+// the value is treated as a name and looked up in cfg.Upstreams.
+func resolveUpstream(rc config.RouteConfig, upstreams map[string]config.UpstreamConfig) (upstreamURL string, rewriteHost bool, insecure bool) {
+	if strings.Contains(rc.Upstream, "://") {
+		return rc.Upstream, rc.RewriteHost, rc.Insecure
+	}
+	up, ok := upstreams[rc.Upstream]
+	if !ok {
+		// Already validated at startup; this is a safety fallback.
+		log.Fatalf("[dev-proxy] unknown upstream %q (should have been caught at startup)", rc.Upstream)
+	}
+	return up.URL, up.RewriteHost, up.Insecure
+}
 
-		matched = append(matched, router.MatchedRoute{
-			PathPrefix:  rc.PathPrefix,
-			HostMatch:   rc.HostMatch,
-			Upstream:    rc.Upstream,
-			RewriteHost: rc.RewriteHost,
-			CORS:        corsCfg,
-			StaticDir:   rc.StaticDir,
-			Insecure:    rc.Insecure,
-		})
+// buildMatchedRoute converts a config RouteConfig into a router.MatchedRoute,
+// resolving named upstreams and compiling regex patterns.
+func buildMatchedRoute(i int, rc config.RouteConfig, upstreams map[string]config.UpstreamConfig) router.MatchedRoute {
+	corsCfg := &router.CORSConfig{}
+	if rc.CORSAllowOrigin != "" {
+		corsCfg.Enabled = true
+		corsCfg.AllowOrigin = rc.CORSAllowOrigin
 	}
 
-	if len(matched) == 0 {
-		matched = append(matched, router.MatchedRoute{
-			PathPrefix: "/",
+	upstreamURL, rewriteHost, insecure := resolveUpstream(rc, upstreams)
+
+	mr := router.MatchedRoute{
+		PathPrefix:   rc.PathPrefix,
+		PathExact:    rc.PathExact,
+		HostMatch:    rc.HostMatch,
+		Upstream:     upstreamURL,
+		UpstreamPath: rc.UpstreamPath,
+		RewriteHost:  rewriteHost,
+		CORS:         corsCfg,
+		StaticDir:    rc.StaticDir,
+		Insecure:     insecure,
+	}
+
+	if rc.PathRegex != "" {
+		re, err := regexp.Compile(rc.PathRegex)
+		if err != nil {
+			log.Fatalf("[dev-proxy] route %d: invalid path_regex %q: %v", i, rc.PathRegex, err)
+		}
+		mr.PathRegex = re
+	}
+
+	return mr
+}
+
+// buildHostGroups constructs router.HostGroup slices from config.
+// When cfg.Hosts is defined it takes precedence; cfg.Routes is wrapped in an
+// implicit "*" group otherwise.
+func buildHostGroups(cfg *config.Config) []router.HostGroup {
+	if len(cfg.Hosts) > 0 {
+		var groups []router.HostGroup
+		for _, hg := range cfg.Hosts {
+			var routes []router.MatchedRoute
+			for i, rc := range hg.Routes {
+				routes = append(routes, buildMatchedRoute(i, rc, cfg.Upstreams))
+			}
+			groups = append(groups, router.HostGroup{
+				Match:  hg.Match,
+				Routes: routes,
+			})
+		}
+		return groups
+	}
+
+	// Flat routes — wrap in catch-all host group.
+	var routes []router.MatchedRoute
+	for i, rc := range cfg.Routes {
+		routes = append(routes, buildMatchedRoute(i, rc, cfg.Upstreams))
+	}
+	if len(routes) == 0 {
+		routes = append(routes, router.MatchedRoute{
+			PathPrefix:  "/",
 			RewriteHost: true,
 		})
 	}
-
-	return matched
+	return []router.HostGroup{{Match: "*", Routes: routes}}
 }
 
-func matchRoutesToPorts(routes []router.MatchedRoute, ports []int) map[int][]router.MatchedRoute {
-	result := make(map[int][]router.MatchedRoute)
-	for _, port := range ports {
-		for _, r := range routes {
-			mr := r
-			mr.LocalPort = port
-			result[port] = append(result[port], mr)
-		}
-	}
-	return result
-}
-
-func startServers(cfg *config.Config, matchedRoutes []router.MatchedRoute, rt *router.Router, cm *devtls.CertManager, sm *shutdown.Manager) map[int]*http.Server {
-	portRoutes := matchRoutesToPorts(matchedRoutes, cfg.Server.ListenPorts)
+func startServers(cfg *config.Config, rt *router.Router, cm *devtls.CertManager, sm *shutdown.Manager) map[int]*http.Server {
 	servers := make(map[int]*http.Server)
 
 	for _, port := range cfg.Server.ListenPorts {
 		isTLS := isPortTLSEnabled(port, cfg)
-		handler := buildHandler(portRoutes[port], rt, &cfg.Server, isTLS)
+		handler := buildHandler(rt, &cfg.Server, isTLS)
 
 		addr := fmt.Sprintf(":%d", port)
 		srv := &http.Server{
@@ -128,9 +168,7 @@ func startServers(cfg *config.Config, matchedRoutes []router.MatchedRoute, rt *r
 					log.Fatalf("[dev-proxy] Failed to generate self-signed certificate for port %d: %v", port, err)
 				}
 			}
-			tlsCfg := &tls.Config{
-				Certificates: []tls.Certificate{},
-			}
+			tlsCfg := &tls.Config{Certificates: []tls.Certificate{}}
 			cert, err := tls.X509KeyPair(cp.CertPEM, cp.KeyPEM)
 			if err != nil {
 				log.Fatalf("[dev-proxy] Failed to parse certificate for port %d: %v", port, err)
@@ -168,8 +206,6 @@ func isPortTLSEnabled(port int, cfg *config.Config) bool {
 	if cfg.Server.TLS == nil || !cfg.Server.TLS.Enabled {
 		return false
 	}
-	// TLS is applied to the highest port in listen_ports.
-	// With [80, 443]: 443 gets TLS. With [8443] alone: 8443 gets TLS.
 	maxPort := 0
 	for _, p := range cfg.Server.ListenPorts {
 		if p > maxPort {
@@ -187,18 +223,18 @@ func handlePortError(port int, err error) {
 	log.Fatalf("[dev-proxy] FATAL: server on port %d error: %v", port, err)
 }
 
-func buildHandler(portRoutes []router.MatchedRoute, rt *router.Router, serverCfg *config.ServerConfig, isTLS bool) http.Handler {
+func buildHandler(rt *router.Router, serverCfg *config.ServerConfig, isTLS bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		route := rt.Match(r)
 		if route == nil {
-			router.HandleNotFound(w)
+			router.HandleNoMatch(w, r)
 			return
 		}
 
 		var handler http.Handler
 
 		if route.Upstream != "" {
-			rp, err := proxy.NewReverseProxy(route.Upstream, route.RewriteHost, route.Insecure)
+			rp, err := proxy.NewReverseProxy(route.Upstream, route.RewriteHost, route.Insecure, route.PathPrefix, route.UpstreamPath)
 			if err != nil {
 				log.Fatalf("Failed to create reverse proxy for upstream %s: %v", route.Upstream, err)
 			}
@@ -208,18 +244,16 @@ func buildHandler(portRoutes []router.MatchedRoute, rt *router.Router, serverCfg
 		}
 
 		if handler == nil {
-			router.HandleNotFound(w)
+			router.HandleNoMatch(w, r)
 			return
 		}
 
 		if route.StaticDir != "" {
-			staticHandler := static.Serve(route.StaticDir, handler)
-			handler = staticHandler
+			handler = static.Serve(route.StaticDir, handler)
 		}
 
 		if route.CORS != nil && route.CORS.Enabled {
-			corsHandler := cors.Middleware(handler, route.CORS)
-			handler = corsHandler
+			handler = cors.Middleware(handler, route.CORS)
 		}
 
 		if serverCfg.RedirectHTTP && !isTLS {
@@ -265,7 +299,6 @@ func loggingMiddleware(next http.Handler, route *router.MatchedRoute) http.Handl
 		if upstream == "" {
 			upstream = "static:" + route.StaticDir
 		}
-
 		fmt.Printf("[%s] %s %s → %s (%d) %v\n",
 			r.Method, r.URL.Path, r.Host, upstream, lw.statusCode, duration)
 	})
@@ -281,7 +314,7 @@ func (lw *loggingResponseWriter) WriteHeader(code int) {
 	lw.ResponseWriter.WriteHeader(code)
 }
 
-func printBanner(cfg *config.Config, routes []router.MatchedRoute) {
+func printBanner(cfg *config.Config, groups []router.HostGroup) {
 	fmt.Println()
 	fmt.Println("  ┌─────────────────────────────────────┐")
 	fmt.Println("  │         dev-proxy v0.1.0            │")
@@ -292,12 +325,19 @@ func printBanner(cfg *config.Config, routes []router.MatchedRoute) {
 		if isPortTLSEnabled(port, cfg) {
 			scheme = "https"
 		}
-		for _, r := range routes {
-			target := r.Upstream
-			if target == "" {
-				target = "static:" + r.StaticDir
+		for _, g := range groups {
+			for _, r := range g.Routes {
+				target := r.Upstream
+				if target == "" {
+					target = "static:" + r.StaticDir
+				}
+				prefix := r.PathPrefix
+				if prefix == "" {
+					prefix = r.PathExact
+				}
+				fmt.Printf("  │  %s://localhost:%d%s [host:%s] → %s\n",
+					scheme, port, prefix, g.Match, target)
 			}
-			fmt.Printf("  │  %s://localhost:%d%s → %s\n", scheme, port, r.PathPrefix, target)
 		}
 	}
 

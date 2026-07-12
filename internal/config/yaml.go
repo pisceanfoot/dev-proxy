@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -23,22 +24,41 @@ type ServerConfig struct {
 	RedirectHTTP bool       `yaml:"redirect_http"`
 }
 
+// UpstreamConfig defines a reusable named upstream target.
+type UpstreamConfig struct {
+	URL         string `yaml:"url"`
+	RewriteHost bool   `yaml:"rewrite_host"`
+	Insecure    bool   `yaml:"insecure"`
+}
+
 // RouteConfig is a pure proxy rule — no port or TLS fields.
 type RouteConfig struct {
-	PathPrefix    string `yaml:"path_prefix"`
-	HostMatch     string `yaml:"host_match"`
-	Upstream      string `yaml:"upstream"`
-	RewriteHost   bool   `yaml:"rewrite_host"`
+	PathPrefix      string `yaml:"path_prefix"`
+	PathExact       string `yaml:"path_exact"`
+	PathRegex       string `yaml:"path_regex"`
+	HostMatch       string `yaml:"host_match"`
+	Upstream        string `yaml:"upstream"`
+	UpstreamPath    string `yaml:"upstream_path"`
+	RewriteHost     bool   `yaml:"rewrite_host"`
 	CORSAllowOrigin string `yaml:"cors_allow_origin"`
-	StaticDir     string `yaml:"static_dir"`
-	Insecure      bool   `yaml:"insecure"`
+	StaticDir       string `yaml:"static_dir"`
+	Insecure        bool   `yaml:"insecure"`
+}
+
+// HostGroup groups routes under a host match pattern.
+// Entries are evaluated in declaration order — first match wins.
+type HostGroup struct {
+	Match  string        `yaml:"match"`
+	Routes []RouteConfig `yaml:"routes"`
 }
 
 // Config is the top-level YAML configuration.
 type Config struct {
-	Server     ServerConfig    `yaml:"server"`
-	Routes     []RouteConfig   `yaml:"routes"`
-	ConfigPath string          `yaml:"-"`
+	Server     ServerConfig              `yaml:"server"`
+	Upstreams  map[string]UpstreamConfig `yaml:"upstreams"`
+	Hosts      []HostGroup               `yaml:"hosts"`
+	Routes     []RouteConfig             `yaml:"routes"`
+	ConfigPath string                    `yaml:"-"`
 }
 
 // Load reads dev-proxy.yaml and applies CLI flags (which override).
@@ -99,16 +119,60 @@ func validate(cfg *Config) error {
 		}
 	}
 
-	for i, r := range cfg.Routes {
-		if r.PathPrefix == "" {
-			cfg.Routes[i].PathPrefix = "/"
+	// Validate named upstreams.
+	for name, up := range cfg.Upstreams {
+		if name == "" {
+			return fmt.Errorf("upstream name must not be empty")
 		}
-		if r.Upstream != "" {
-			if _, err := url.Parse(r.Upstream); err != nil {
-				return fmt.Errorf("route %d: invalid upstream URL %q: %w", i, r.Upstream, err)
+		if up.URL == "" {
+			return fmt.Errorf("upstream %q: url must not be empty", name)
+		}
+		if _, err := url.Parse(up.URL); err != nil {
+			return fmt.Errorf("upstream %q: invalid url %q: %w", name, up.URL, err)
+		}
+	}
+
+	// Validate host groups.
+	for i, hg := range cfg.Hosts {
+		if hg.Match == "" {
+			return fmt.Errorf("hosts[%d]: match must not be empty", i)
+		}
+		if len(hg.Routes) == 0 {
+			return fmt.Errorf("hosts[%d] (match=%q): routes must not be empty", i, hg.Match)
+		}
+		for j, r := range hg.Routes {
+			if err := validateRoute(i*1000+j, r, cfg.Upstreams); err != nil {
+				return fmt.Errorf("hosts[%d].routes[%d]: %w", i, j, err)
 			}
 		}
 	}
 
+	// Warn when both hosts and routes are defined.
+	if len(cfg.Hosts) > 0 && len(cfg.Routes) > 0 {
+		fmt.Fprintln(os.Stderr, "[dev-proxy] WARNING: both 'hosts' and 'routes' defined; 'routes' is ignored — use 'hosts' only")
+	}
+
+	// Validate flat routes.
+	for i, r := range cfg.Routes {
+		if err := validateRoute(i, r, cfg.Upstreams); err != nil {
+			return fmt.Errorf("route %d: %w", i, err)
+		}
+	}
+
+	return nil
+}
+
+func validateRoute(idx int, r RouteConfig, upstreams map[string]UpstreamConfig) error {
+	if r.Upstream != "" {
+		if strings.Contains(r.Upstream, "://") {
+			if _, err := url.Parse(r.Upstream); err != nil {
+				return fmt.Errorf("invalid upstream URL %q: %w", r.Upstream, err)
+			}
+		} else {
+			if _, ok := upstreams[r.Upstream]; !ok {
+				return fmt.Errorf("upstream %q is not defined in the upstreams map", r.Upstream)
+			}
+		}
+	}
 	return nil
 }
