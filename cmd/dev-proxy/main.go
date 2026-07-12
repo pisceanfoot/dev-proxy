@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,23 +23,23 @@ import (
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
+		log.Fatalf("[dev-proxy] Failed to load configuration: %v", err)
 	}
 
 	cm := devtls.NewCertManager()
 	sm := shutdown.New(5 * time.Second)
 
-	routes := buildRoutes(cfg, cm)
+	routes := buildRoutes(cfg)
 	rt := router.New(routes)
 
-	servers := startServers(routes, rt, cm, sm)
+	servers := startServers(cfg, routes, rt, cm, sm)
 
-	w, err := watcher.New(cfg.EnvFile, func() error {
+	w, err := watcher.New(cfg.ConfigPath, func() error {
 		newCfg, err := config.Load()
 		if err != nil {
 			return err
 		}
-		newRoutes := buildRoutes(newCfg, cm)
+		newRoutes := buildRoutes(newCfg)
 		rt = router.New(newRoutes)
 		fmt.Println("[dev-proxy] Routes updated")
 		return nil
@@ -50,14 +51,14 @@ func main() {
 		}
 	}
 
-	printBanner(routes)
+	printBanner(cfg, routes)
 
 	sm.Wait()
 	shutdownServers(servers)
 }
 
-func buildRoutes(cfg *config.Config, cm *devtls.CertManager) []router.MatchedRoute {
-	var routes []router.MatchedRoute
+func buildRoutes(cfg *config.Config) []router.MatchedRoute {
+	var matched []router.MatchedRoute
 	for _, rc := range cfg.Routes {
 		corsCfg := &router.CORSConfig{}
 		if rc.CORSAllowOrigin != "" {
@@ -65,70 +66,94 @@ func buildRoutes(cfg *config.Config, cm *devtls.CertManager) []router.MatchedRou
 			corsCfg.AllowOrigin = rc.CORSAllowOrigin
 		}
 
-		routes = append(routes, router.MatchedRoute{
-			LocalPort:   rc.LocalPort,
+		matched = append(matched, router.MatchedRoute{
 			PathPrefix:  rc.PathPrefix,
 			HostMatch:   rc.HostMatch,
 			Upstream:    rc.Upstream,
 			RewriteHost: rc.RewriteHost,
 			CORS:        corsCfg,
 			StaticDir:   rc.StaticDir,
-			TLSEnabled:  rc.TLSEnabled,
 			Insecure:    rc.Insecure,
 		})
 	}
-	return routes
+
+	if len(matched) == 0 {
+		matched = append(matched, router.MatchedRoute{
+			PathPrefix: "/",
+			RewriteHost: true,
+		})
+	}
+
+	return matched
 }
 
-func startServers(routes []router.MatchedRoute, rt *router.Router, cm *devtls.CertManager, sm *shutdown.Manager) map[int]*http.Server {
+func matchRoutesToPorts(routes []router.MatchedRoute, ports []int) map[int][]router.MatchedRoute {
+	result := make(map[int][]router.MatchedRoute)
+	for _, port := range ports {
+		for _, r := range routes {
+			mr := r
+			mr.LocalPort = port
+			result[port] = append(result[port], mr)
+		}
+	}
+	return result
+}
+
+func startServers(cfg *config.Config, matchedRoutes []router.MatchedRoute, rt *router.Router, cm *devtls.CertManager, sm *shutdown.Manager) map[int]*http.Server {
+	portRoutes := matchRoutesToPorts(matchedRoutes, cfg.Server.ListenPorts)
 	servers := make(map[int]*http.Server)
 
-	for _, route := range routes {
-		handler := buildHandler(route, rt)
+	for _, port := range cfg.Server.ListenPorts {
+		isTLS := isPortTLSEnabled(port, cfg)
+		handler := buildHandler(portRoutes[port], rt, &cfg.Server, isTLS)
 
-		addr := fmt.Sprintf(":%d", route.LocalPort)
-		var srv *http.Server
+		addr := fmt.Sprintf(":%d", port)
+		srv := &http.Server{
+			Addr:    addr,
+			Handler: handler,
+		}
 
-		if route.TLSEnabled {
-			cp, err := cm.GetOrGenerate(fmt.Sprintf("%d", route.LocalPort))
-			if err != nil {
-				log.Fatalf("Failed to generate certificate for port %d: %v", route.LocalPort, err)
+		if isTLS {
+			var cp *devtls.CertPair
+			var err error
+
+			if cfg.Server.TLS != nil && cfg.Server.TLS.CertFile != "" {
+				cp, err = cm.LoadFromDisk(cfg.Server.TLS.CertFile, cfg.Server.TLS.KeyFile)
+				if err != nil {
+					log.Fatalf("[dev-proxy] Failed to load certificate for port %d: %v", port, err)
+				}
+			} else {
+				cp, err = cm.GetOrGenerate("server")
+				if err != nil {
+					log.Fatalf("[dev-proxy] Failed to generate self-signed certificate for port %d: %v", port, err)
+				}
 			}
 			tlsCfg := &tls.Config{
 				Certificates: []tls.Certificate{},
 			}
-			// Parse PEM into tls.Certificate
 			cert, err := tls.X509KeyPair(cp.CertPEM, cp.KeyPEM)
 			if err != nil {
-				log.Fatalf("Failed to parse certificate for port %d: %v", route.LocalPort, err)
+				log.Fatalf("[dev-proxy] Failed to parse certificate for port %d: %v", port, err)
 			}
 			tlsCfg.Certificates = append(tlsCfg.Certificates, cert)
+			srv.TLSConfig = tlsCfg
 
-			srv = &http.Server{
-				Addr:      addr,
-				Handler:   handler,
-				TLSConfig: tlsCfg,
-			}
-			go func() {
+			go func(p int) {
 				fmt.Printf("[dev-proxy] Listening on https://localhost%s\n", addr)
 				if err := srv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-					log.Fatalf("HTTPS server error: %v", err)
+					handlePortError(p, err)
 				}
-			}()
+			}(port)
 		} else {
-			srv = &http.Server{
-				Addr:    addr,
-				Handler: handler,
-			}
-			go func() {
+			go func(p int) {
 				fmt.Printf("[dev-proxy] Listening on http://localhost%s\n", addr)
 				if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-					log.Fatalf("HTTP server error: %v", err)
+					handlePortError(p, err)
 				}
-			}()
+			}(port)
 		}
 
-		servers[route.LocalPort] = srv
+		servers[port] = srv
 		sm.Register(func() error {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -139,36 +164,94 @@ func startServers(routes []router.MatchedRoute, rt *router.Router, cm *devtls.Ce
 	return servers
 }
 
-func buildHandler(route router.MatchedRoute, rt *router.Router) http.Handler {
-	var handler http.Handler
-
-	// Reverse proxy handler
-	if route.Upstream != "" {
-		rp, err := proxy.NewReverseProxy(route.Upstream, route.RewriteHost, route.Insecure)
-		if err != nil {
-			log.Fatalf("Failed to create reverse proxy for upstream %s: %v", route.Upstream, err)
+func isPortTLSEnabled(port int, cfg *config.Config) bool {
+	if cfg.Server.TLS == nil || !cfg.Server.TLS.Enabled {
+		return false
+	}
+	// TLS is applied to the highest port in listen_ports.
+	// With [80, 443]: 443 gets TLS. With [8443] alone: 8443 gets TLS.
+	maxPort := 0
+	for _, p := range cfg.Server.ListenPorts {
+		if p > maxPort {
+			maxPort = p
 		}
-		handler = rp
-	} else if route.StaticDir != "" {
-		handler = http.NotFoundHandler()
 	}
+	return port == maxPort
+}
 
-	// Wrap with static file serving (if configured)
-	if route.StaticDir != "" {
-		staticHandler := static.Serve(route.StaticDir, handler)
-		handler = staticHandler
+func handlePortError(port int, err error) {
+	if strings.Contains(err.Error(), "address already in use") {
+		log.Fatalf("[dev-proxy] FATAL: port %d is already in use — another process is bound to it. Run 'lsof -i :%d' or 'netstat -an | grep %d' to find the conflicting process.",
+			port, port, port)
 	}
+	log.Fatalf("[dev-proxy] FATAL: server on port %d error: %v", port, err)
+}
 
-	// Wrap with CORS middleware (if configured)
-	if route.CORS != nil && route.CORS.Enabled {
-		corsHandler := cors.Middleware(handler, route.CORS)
-		handler = corsHandler
+func buildHandler(portRoutes []router.MatchedRoute, rt *router.Router, serverCfg *config.ServerConfig, isTLS bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		route := rt.Match(r)
+		if route == nil {
+			router.HandleNotFound(w)
+			return
+		}
+
+		var handler http.Handler
+
+		if route.Upstream != "" {
+			rp, err := proxy.NewReverseProxy(route.Upstream, route.RewriteHost, route.Insecure)
+			if err != nil {
+				log.Fatalf("Failed to create reverse proxy for upstream %s: %v", route.Upstream, err)
+			}
+			handler = rp
+		} else if route.StaticDir != "" {
+			handler = http.NotFoundHandler()
+		}
+
+		if handler == nil {
+			router.HandleNotFound(w)
+			return
+		}
+
+		if route.StaticDir != "" {
+			staticHandler := static.Serve(route.StaticDir, handler)
+			handler = staticHandler
+		}
+
+		if route.CORS != nil && route.CORS.Enabled {
+			corsHandler := cors.Middleware(handler, route.CORS)
+			handler = corsHandler
+		}
+
+		if serverCfg.RedirectHTTP && !isTLS {
+			targetPort := findTLSPort(serverCfg.ListenPorts)
+			if targetPort > 0 {
+				handler = redirectMiddleware(handler, targetPort)
+			}
+		}
+
+		loggingMiddleware(handler, route).ServeHTTP(w, r)
+	})
+}
+
+func findTLSPort(ports []int) int {
+	max := 0
+	for _, p := range ports {
+		if p > max {
+			max = p
+		}
 	}
+	return max
+}
 
-	// Wrap with logging middleware
-	handler = loggingMiddleware(handler, &route)
-
-	return handler
+func redirectMiddleware(next http.Handler, targetPort int) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if host == "" {
+			host = "localhost"
+		}
+		target := fmt.Sprintf("https://%s:%d%s", host, targetPort, r.URL.Path)
+		http.Redirect(w, r, target, http.StatusMovedPermanently)
+	})
 }
 
 func loggingMiddleware(next http.Handler, route *router.MatchedRoute) http.Handler {
@@ -198,22 +281,26 @@ func (lw *loggingResponseWriter) WriteHeader(code int) {
 	lw.ResponseWriter.WriteHeader(code)
 }
 
-func printBanner(routes []router.MatchedRoute) {
+func printBanner(cfg *config.Config, routes []router.MatchedRoute) {
 	fmt.Println()
 	fmt.Println("  ┌─────────────────────────────────────┐")
 	fmt.Println("  │         dev-proxy v0.1.0            │")
 	fmt.Println("  ├─────────────────────────────────────┤")
-	for _, r := range routes {
+
+	for _, port := range cfg.Server.ListenPorts {
 		scheme := "http"
-		if r.TLSEnabled {
+		if isPortTLSEnabled(port, cfg) {
 			scheme = "https"
 		}
-		target := r.Upstream
-		if target == "" {
-			target = "static:" + r.StaticDir
+		for _, r := range routes {
+			target := r.Upstream
+			if target == "" {
+				target = "static:" + r.StaticDir
+			}
+			fmt.Printf("  │  %s://localhost:%d%s → %s\n", scheme, port, r.PathPrefix, target)
 		}
-		fmt.Printf("  │  %s://localhost:%d%s → %s\n", scheme, r.LocalPort, r.PathPrefix, target)
 	}
+
 	fmt.Println("  └─────────────────────────────────────┘")
 	fmt.Println()
 

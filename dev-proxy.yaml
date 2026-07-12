@@ -1,0 +1,16 @@
+# dev-proxy test configuration
+# Run with: go run ./cmd/dev-proxy/ -config dev-proxy.yaml
+
+server:
+  listen_ports: [8080, 8443]
+  tls:
+    enabled: false
+    # cert_file: ./certs/cert.pem   # omit to auto-generate a self-signed cert
+    # key_file:  ./certs/key.pem
+  redirect_http: false # http://localhost:8080 → https://localhost:8443
+
+routes:
+  - path_prefix: "/"
+    upstream: "https://www.baidu.com"
+    rewrite_host: true
+    insecure: false
