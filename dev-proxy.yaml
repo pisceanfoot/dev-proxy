@@ -58,7 +58,7 @@ hosts:
 
   - match: "*"
     upstream: "https://httpbun.com"
-    rewrite_host: true  # host-level default — inline-upstream routes without rewrite_host inherit this
+    rewrite_host: true # host-level default — inline-upstream routes without rewrite_host inherit this
     routes:
       # Inline URL — rewrite_host inherited from host level above (omit it here)
       - path_prefix: "/"
