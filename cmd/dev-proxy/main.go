@@ -173,7 +173,12 @@ func logStartupInfo(cfg *config.Config, groups []router.HostGroup) {
 // connection settings.
 func resolveUpstream(rc config.RouteConfig, upstreams map[string]config.UpstreamConfig) (upstreamURL string, rewriteHost bool, insecure bool) {
 	if strings.Contains(rc.Upstream, "://") {
-		return rc.Upstream, rc.RewriteHost, rc.Insecure
+		// Inline URL: RewriteHost is a *bool; dereference or default to false.
+		rh := false
+		if rc.RewriteHost != nil {
+			rh = *rc.RewriteHost
+		}
+		return rc.Upstream, rh, rc.Insecure
 	}
 	up, ok := upstreams[rc.Upstream]
 	if !ok {
@@ -185,7 +190,10 @@ func resolveUpstream(rc config.RouteConfig, upstreams map[string]config.Upstream
 // buildMatchedRoute converts a config RouteConfig into a router.MatchedRoute.
 // hostUpstream is the host-group-level default upstream; it is used when
 // rc.Upstream is empty (route inherits from its host group).
-func buildMatchedRoute(i int, rc config.RouteConfig, hostUpstream string, upstreams map[string]config.UpstreamConfig) router.MatchedRoute {
+// hostRewriteHost is the host-group-level default rewrite_host; it is used
+// for inline-upstream routes that omit their own rewrite_host field.
+// Named-upstream routes take rewrite_host from the upstream definition instead.
+func buildMatchedRoute(i int, rc config.RouteConfig, hostUpstream string, hostRewriteHost *bool, upstreams map[string]config.UpstreamConfig) router.MatchedRoute {
 	corsCfg := &router.CORSConfig{}
 	if rc.CORSAllowOrigin != "" {
 		corsCfg.Enabled = true
@@ -196,6 +204,18 @@ func buildMatchedRoute(i int, rc config.RouteConfig, hostUpstream string, upstre
 	effectiveRC := rc
 	if effectiveRC.Upstream == "" {
 		effectiveRC.Upstream = hostUpstream
+	}
+
+	// Resolve effective rewrite_host for inline-upstream routes:
+	//   route-level ptr → host-level ptr → false.
+	// Named-upstream routes get rewrite_host from the upstream definition
+	// (handled inside resolveUpstream), so we only apply inheritance here.
+	if rc.RewriteHost == nil {
+		effectiveRewriteHost := false
+		if hostRewriteHost != nil {
+			effectiveRewriteHost = *hostRewriteHost
+		}
+		effectiveRC.RewriteHost = &effectiveRewriteHost
 	}
 
 	upstreamURL, rewriteHost, insecure := resolveUpstream(effectiveRC, upstreams)
@@ -230,7 +250,7 @@ func buildHostGroups(cfg *config.Config) []router.HostGroup {
 		for _, hg := range cfg.Hosts {
 			var routes []router.MatchedRoute
 			for i, rc := range hg.Routes {
-				routes = append(routes, buildMatchedRoute(i, rc, hg.Upstream, cfg.Upstreams))
+				routes = append(routes, buildMatchedRoute(i, rc, hg.Upstream, hg.RewriteHost, cfg.Upstreams))
 			}
 			groups = append(groups, router.HostGroup{
 				Match:  hg.Match,
@@ -242,7 +262,7 @@ func buildHostGroups(cfg *config.Config) []router.HostGroup {
 
 	var routes []router.MatchedRoute
 	for i, rc := range cfg.Routes {
-		routes = append(routes, buildMatchedRoute(i, rc, "", cfg.Upstreams))
+		routes = append(routes, buildMatchedRoute(i, rc, "", nil, cfg.Upstreams))
 	}
 	if len(routes) == 0 {
 		routes = append(routes, router.MatchedRoute{

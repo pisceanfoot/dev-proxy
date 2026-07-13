@@ -31,6 +31,8 @@ type UpstreamConfig struct {
 }
 
 // RouteConfig is a pure proxy rule — no port or TLS fields.
+// RewriteHost is a pointer so that omitting the field in YAML ("not set / inherit
+// from host group") is distinguishable from explicitly writing rewrite_host: false.
 type RouteConfig struct {
 	PathPrefix      string `yaml:"path_prefix"`
 	PathExact       string `yaml:"path_exact"`
@@ -38,7 +40,7 @@ type RouteConfig struct {
 	HostMatch       string `yaml:"host_match"`
 	Upstream        string `yaml:"upstream"`
 	UpstreamPath    string `yaml:"upstream_path"`
-	RewriteHost     bool   `yaml:"rewrite_host"`
+	RewriteHost     *bool  `yaml:"rewrite_host"`
 	CORSAllowOrigin string `yaml:"cors_allow_origin"`
 	StaticDir       string `yaml:"static_dir"`
 	Insecure        bool   `yaml:"insecure"`
@@ -48,10 +50,13 @@ type RouteConfig struct {
 // Entries are evaluated in declaration order — first match wins.
 // The optional Upstream field provides a default upstream for routes that
 // do not specify their own; route-level upstream always takes precedence.
+// The optional RewriteHost field provides a default rewrite_host setting for
+// inline-upstream routes that omit their own; route-level always takes precedence.
 type HostGroup struct {
-	Match    string        `yaml:"match"`
-	Upstream string        `yaml:"upstream"`
-	Routes   []RouteConfig `yaml:"routes"`
+	Match       string        `yaml:"match"`
+	Upstream    string        `yaml:"upstream"`
+	RewriteHost *bool         `yaml:"rewrite_host"`
+	Routes      []RouteConfig `yaml:"routes"`
 }
 
 // Config is the top-level YAML configuration.

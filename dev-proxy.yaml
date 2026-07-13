@@ -57,8 +57,8 @@ hosts:
         upstream: web
 
   - match: "*"
-    upstream: "https://www.baidu.com"
+    upstream: "https://httpbun.com"
+    rewrite_host: true  # host-level default — inline-upstream routes without rewrite_host inherit this
     routes:
-      # Inline URL — backward-compatible syntax still works
+      # Inline URL — rewrite_host inherited from host level above (omit it here)
       - path_prefix: "/"
-        rewrite_host: true
