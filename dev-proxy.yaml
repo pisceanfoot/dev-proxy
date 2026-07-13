@@ -62,3 +62,4 @@ hosts:
     routes:
       # Inline URL — rewrite_host inherited from host level above (omit it here)
       - path_prefix: "/"
+        cors_allow_origin: "*"

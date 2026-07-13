@@ -193,11 +193,19 @@ func resolveUpstream(rc config.RouteConfig, upstreams map[string]config.Upstream
 // hostRewriteHost is the host-group-level default rewrite_host; it is used
 // for inline-upstream routes that omit their own rewrite_host field.
 // Named-upstream routes take rewrite_host from the upstream definition instead.
-func buildMatchedRoute(i int, rc config.RouteConfig, hostUpstream string, hostRewriteHost *bool, upstreams map[string]config.UpstreamConfig) router.MatchedRoute {
+// hostCORSAllowOrigin is the host-group-level default cors_allow_origin; it is
+// used when the route omits its own cors_allow_origin field.
+func buildMatchedRoute(i int, rc config.RouteConfig, hostUpstream string, hostRewriteHost *bool, hostCORSAllowOrigin string, upstreams map[string]config.UpstreamConfig) router.MatchedRoute {
+	// Resolve effective CORS origin: route-level wins, host-level is fallback.
+	effectiveCORSOrigin := rc.CORSAllowOrigin
+	if effectiveCORSOrigin == "" {
+		effectiveCORSOrigin = hostCORSAllowOrigin
+	}
+
 	corsCfg := &router.CORSConfig{}
-	if rc.CORSAllowOrigin != "" {
+	if effectiveCORSOrigin != "" {
 		corsCfg.Enabled = true
-		corsCfg.AllowOrigin = rc.CORSAllowOrigin
+		corsCfg.AllowOrigin = effectiveCORSOrigin
 	}
 
 	// Resolve effective upstream: route-level wins, host-level is fallback.
@@ -250,7 +258,7 @@ func buildHostGroups(cfg *config.Config) []router.HostGroup {
 		for _, hg := range cfg.Hosts {
 			var routes []router.MatchedRoute
 			for i, rc := range hg.Routes {
-				routes = append(routes, buildMatchedRoute(i, rc, hg.Upstream, hg.RewriteHost, cfg.Upstreams))
+				routes = append(routes, buildMatchedRoute(i, rc, hg.Upstream, hg.RewriteHost, hg.CORSAllowOrigin, cfg.Upstreams))
 			}
 			groups = append(groups, router.HostGroup{
 				Match:  hg.Match,
@@ -262,7 +270,7 @@ func buildHostGroups(cfg *config.Config) []router.HostGroup {
 
 	var routes []router.MatchedRoute
 	for i, rc := range cfg.Routes {
-		routes = append(routes, buildMatchedRoute(i, rc, "", nil, cfg.Upstreams))
+		routes = append(routes, buildMatchedRoute(i, rc, "", nil, "", cfg.Upstreams))
 	}
 	if len(routes) == 0 {
 		routes = append(routes, router.MatchedRoute{

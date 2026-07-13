@@ -52,11 +52,14 @@ type RouteConfig struct {
 // do not specify their own; route-level upstream always takes precedence.
 // The optional RewriteHost field provides a default rewrite_host setting for
 // inline-upstream routes that omit their own; route-level always takes precedence.
+// The optional CORSAllowOrigin field sets the default CORS allowed origin for
+// all routes in the group; route-level cors_allow_origin always takes precedence.
 type HostGroup struct {
-	Match       string        `yaml:"match"`
-	Upstream    string        `yaml:"upstream"`
-	RewriteHost *bool         `yaml:"rewrite_host"`
-	Routes      []RouteConfig `yaml:"routes"`
+	Match           string        `yaml:"match"`
+	Upstream        string        `yaml:"upstream"`
+	RewriteHost     *bool         `yaml:"rewrite_host"`
+	CORSAllowOrigin string        `yaml:"cors_allow_origin"`
+	Routes          []RouteConfig `yaml:"routes"`
 }
 
 // Config is the top-level YAML configuration.

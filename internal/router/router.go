@@ -12,7 +12,6 @@ import (
 type CORSConfig struct {
 	Enabled         bool
 	AllowOrigin     string // "*" or specific origin
-	ForwardUpstream bool   // if true, pass through upstream CORS headers instead of injecting own
 }
 
 // MatchedRoute is the result of matching a request against the route table.
