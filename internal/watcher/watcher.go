@@ -7,19 +7,25 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// Watcher watches a .env file for changes and triggers a reload callback.
+// Watcher watches a config file for changes and triggers a reload callback.
 type Watcher struct {
-	fsWatcher  *fsnotify.Watcher
-	filePath   string
-	reloadFunc func() error
-	mu         sync.Mutex
+	fsWatcher   *fsnotify.Watcher
+	filePath    string
+	reloadFunc  func() error
+	onReloadErr func(error) // called when reloadFunc returns an error
+	onFSErr     func(error) // called when fsnotify reports an internal error
+	mu          sync.Mutex
 }
 
-// New creates a new Watcher for the given .env file path and reload function.
-func New(filePath string, reloadFunc func() error) (*Watcher, error) {
+// New creates a new Watcher.
+// onReloadErr is called (if non-nil) when reloadFunc returns an error.
+// onFSErr is called (if non-nil) when the underlying fsnotify watcher reports an error.
+func New(filePath string, reloadFunc func() error, onReloadErr func(error), onFSErr func(error)) (*Watcher, error) {
 	w := &Watcher{
-		filePath:   filePath,
-		reloadFunc: reloadFunc,
+		filePath:    filePath,
+		reloadFunc:  reloadFunc,
+		onReloadErr: onReloadErr,
+		onFSErr:     onFSErr,
 	}
 
 	fw, err := fsnotify.NewWatcher()
@@ -31,16 +37,15 @@ func New(filePath string, reloadFunc func() error) (*Watcher, error) {
 	return w, nil
 }
 
-// Start begins watching the .env file for changes.
+// Start begins watching the config file for changes.
 func (w *Watcher) Start() error {
-	dir := w.filePath
-	if dir == "" {
-		dir = ".env"
+	path := w.filePath
+	if path == "" {
+		path = "dev-proxy.yaml"
 	}
 
-	err := w.fsWatcher.Add(dir)
-	if err != nil {
-		return fmt.Errorf("add watch for %s: %w", dir, err)
+	if err := w.fsWatcher.Add(path); err != nil {
+		return fmt.Errorf("add watch for %s: %w", path, err)
 	}
 
 	go w.watchLoop()
@@ -55,18 +60,19 @@ func (w *Watcher) watchLoop() {
 				return
 			}
 			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
-				fmt.Println("[dev-proxy] .env file changed, reloading...")
 				if err := w.reloadFunc(); err != nil {
-					fmt.Printf("[dev-proxy] reload error: %v\n", err)
-				} else {
-					fmt.Println("[dev-proxy] config reloaded successfully")
+					if w.onReloadErr != nil {
+						w.onReloadErr(err)
+					}
 				}
 			}
 		case err, ok := <-w.fsWatcher.Errors:
 			if !ok {
 				return
 			}
-			fmt.Printf("[dev-proxy] watcher error: %v\n", err)
+			if w.onFSErr != nil {
+				w.onFSErr(err)
+			}
 		}
 	}
 }

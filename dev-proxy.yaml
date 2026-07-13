@@ -11,7 +11,7 @@ server:
     enabled: true
     # cert_file: ./certs/cert.pem   # omit to auto-generate a self-signed cert
     # key_file:  ./certs/key.pem
-  redirect_http: true # http://localhost:8080 → https://localhost:8443
+  redirect_http: false # http://localhost:8080 → https://localhost:8443
 
 # Named upstream definitions — referenced by routes below.
 upstreams:
@@ -24,31 +24,32 @@ upstreams:
     rewrite_host: true
     insecure: false
   web:
-    url: http://localhost:3000
+    url: http://localhost:3003
     rewrite_host: true
 
 # Host-grouped routes — evaluated in order, first host match wins.
 # Within a group, first path match wins. No fall-through between groups.
 hosts:
   - match: "api.local"
+    upstream: api-v1 # host-level default — routes without upstream inherit this
     routes:
       # Exact path — only /health, nothing else
       - path_exact: "/health"
-        upstream: api-v1
+        # inherits upstream: api-v1 from host
 
       # Regex path — /api/v1/... forwards to api-v1 with path rewrite
       - path_regex: "^/api/v1/"
-        upstream: api-v1
+        # inherits upstream: api-v1 from host
         upstream_path: "/v1" # /api/v1/users → forwarded as /v1/users
 
-      # Prefix path — /api/v2/... forwards to api-v2 with path rewrite
+      # Prefix path — /api/v2/... forwards to api-v2 (overrides host default)
       - path_prefix: "/api/v2"
-        upstream: api-v2
+        upstream: api-v2 # overrides host-level default
         upstream_path: "/v2" # /api/v2/orders → forwarded as /v2/orders
 
       # Catch-all for this host
       - path_prefix: "/"
-        upstream: api-v1
+        # inherits upstream: api-v1 from host
 
   - match: "*.local"
     routes:
@@ -56,8 +57,8 @@ hosts:
         upstream: web
 
   - match: "*"
+    upstream: "https://www.baidu.com"
     routes:
       # Inline URL — backward-compatible syntax still works
       - path_prefix: "/"
-        upstream: "https://www.baidu.com"
         rewrite_host: true

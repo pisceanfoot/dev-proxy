@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"dev-proxy/internal/config"
@@ -22,7 +26,15 @@ import (
 )
 
 func main() {
-	cfg, err := config.Load()
+	// Resolve config path once — flags are parsed only here, never in Load().
+	configPath := "dev-proxy.yaml"
+	if p := os.Getenv("DEV_PROXY_CONFIG"); p != "" {
+		configPath = p
+	}
+	flag.StringVar(&configPath, "config", configPath, "Path to dev-proxy YAML config file")
+	flag.Parse()
+
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		log.Fatalf("[dev-proxy] Failed to load configuration: %v", err)
 	}
@@ -38,22 +50,49 @@ func main() {
 	sm := shutdown.New(5 * time.Second)
 
 	groups := buildHostGroups(cfg)
-	rt := router.New(groups)
 
-	servers := startServers(cfg, rt, cm, sm)
+	// Atomic router pointer — safe for concurrent reads during reload.
+	var rt atomic.Pointer[router.Router]
+	rt.Store(router.New(groups))
 
+	// Snapshot server config at startup for change detection on reload.
+	origServer := cfg.Server
+
+	servers := startServers(cfg, &rt, cm, sm)
 	logStartupInfo(cfg, groups)
 
-	w, err := watcher.New(cfg.ConfigPath, func() error {
-		newCfg, err := config.Load()
-		if err != nil {
-			return err
-		}
-		newGroups := buildHostGroups(newCfg)
-		rt = router.New(newGroups)
-		logger.Info("config reloaded")
-		return nil
-	})
+	w, err := watcher.New(
+		configPath,
+		func() error {
+			newCfg, err := config.Load(configPath)
+			if err != nil {
+				logger.Error("config reload failed: %v", err)
+				return err
+			}
+
+			// Re-apply log level immediately — no restart required.
+			newLevel, err := logger.ParseLevel(newCfg.LogLevel)
+			if err != nil {
+				logger.Error("config reload failed: invalid log_level: %v", err)
+				return err
+			}
+			logger.SetLevel(newLevel)
+
+			// Warn if any server-level config changed (requires restart).
+			if changed := serverConfigChanged(origServer, newCfg.Server); len(changed) > 0 {
+				logger.Info("server config changed (%s); restart required to apply",
+					strings.Join(changed, ", "))
+			}
+
+			// Atomically swap in the new router — routes, hosts, upstreams applied live.
+			newGroups := buildHostGroups(newCfg)
+			rt.Store(router.New(newGroups))
+			logger.Info("config reloaded")
+			return nil
+		},
+		func(e error) { logger.Error("config reload failed: %v", e) },
+		func(e error) { logger.Error("watcher: %v", e) },
+	)
 	if err == nil {
 		sm.Register(w.Close)
 		if err := w.Start(); err != nil {
@@ -63,6 +102,54 @@ func main() {
 
 	sm.Wait()
 	shutdownServers(servers)
+}
+
+// serverConfigChanged returns the names of any server config fields that differ
+// between a (original) and b (new). listen_ports is compared after sorting.
+func serverConfigChanged(a, b config.ServerConfig) []string {
+	var changed []string
+
+	aPorts := make([]int, len(a.ListenPorts))
+	copy(aPorts, a.ListenPorts)
+	bPorts := make([]int, len(b.ListenPorts))
+	copy(bPorts, b.ListenPorts)
+	sort.Ints(aPorts)
+	sort.Ints(bPorts)
+	if !intsEqual(aPorts, bPorts) {
+		changed = append(changed, "listen_ports")
+	}
+
+	if a.RedirectHTTP != b.RedirectHTTP {
+		changed = append(changed, "redirect_http")
+	}
+
+	if tlsConfigChanged(a.TLS, b.TLS) {
+		changed = append(changed, "tls")
+	}
+
+	return changed
+}
+
+func intsEqual(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func tlsConfigChanged(a, b *config.TLSConfig) bool {
+	if (a == nil) != (b == nil) {
+		return true
+	}
+	if a == nil {
+		return false
+	}
+	return a.Enabled != b.Enabled || a.CertFile != b.CertFile || a.KeyFile != b.KeyFile
 }
 
 // logStartupInfo emits info-level startup summary after servers are bound.
@@ -83,8 +170,7 @@ func logStartupInfo(cfg *config.Config, groups []router.HostGroup) {
 }
 
 // resolveUpstream resolves a route's upstream field to a concrete URL plus
-// connection settings. Inline URLs (containing "://") are used as-is; otherwise
-// the value is treated as a name and looked up in cfg.Upstreams.
+// connection settings.
 func resolveUpstream(rc config.RouteConfig, upstreams map[string]config.UpstreamConfig) (upstreamURL string, rewriteHost bool, insecure bool) {
 	if strings.Contains(rc.Upstream, "://") {
 		return rc.Upstream, rc.RewriteHost, rc.Insecure
@@ -96,16 +182,23 @@ func resolveUpstream(rc config.RouteConfig, upstreams map[string]config.Upstream
 	return up.URL, up.RewriteHost, up.Insecure
 }
 
-// buildMatchedRoute converts a config RouteConfig into a router.MatchedRoute,
-// resolving named upstreams and compiling regex patterns.
-func buildMatchedRoute(i int, rc config.RouteConfig, upstreams map[string]config.UpstreamConfig) router.MatchedRoute {
+// buildMatchedRoute converts a config RouteConfig into a router.MatchedRoute.
+// hostUpstream is the host-group-level default upstream; it is used when
+// rc.Upstream is empty (route inherits from its host group).
+func buildMatchedRoute(i int, rc config.RouteConfig, hostUpstream string, upstreams map[string]config.UpstreamConfig) router.MatchedRoute {
 	corsCfg := &router.CORSConfig{}
 	if rc.CORSAllowOrigin != "" {
 		corsCfg.Enabled = true
 		corsCfg.AllowOrigin = rc.CORSAllowOrigin
 	}
 
-	upstreamURL, rewriteHost, insecure := resolveUpstream(rc, upstreams)
+	// Resolve effective upstream: route-level wins, host-level is fallback.
+	effectiveRC := rc
+	if effectiveRC.Upstream == "" {
+		effectiveRC.Upstream = hostUpstream
+	}
+
+	upstreamURL, rewriteHost, insecure := resolveUpstream(effectiveRC, upstreams)
 
 	mr := router.MatchedRoute{
 		PathPrefix:   rc.PathPrefix,
@@ -131,15 +224,13 @@ func buildMatchedRoute(i int, rc config.RouteConfig, upstreams map[string]config
 }
 
 // buildHostGroups constructs router.HostGroup slices from config.
-// When cfg.Hosts is defined it takes precedence; cfg.Routes is wrapped in an
-// implicit "*" group otherwise.
 func buildHostGroups(cfg *config.Config) []router.HostGroup {
 	if len(cfg.Hosts) > 0 {
 		var groups []router.HostGroup
 		for _, hg := range cfg.Hosts {
 			var routes []router.MatchedRoute
 			for i, rc := range hg.Routes {
-				routes = append(routes, buildMatchedRoute(i, rc, cfg.Upstreams))
+				routes = append(routes, buildMatchedRoute(i, rc, hg.Upstream, cfg.Upstreams))
 			}
 			groups = append(groups, router.HostGroup{
 				Match:  hg.Match,
@@ -151,7 +242,7 @@ func buildHostGroups(cfg *config.Config) []router.HostGroup {
 
 	var routes []router.MatchedRoute
 	for i, rc := range cfg.Routes {
-		routes = append(routes, buildMatchedRoute(i, rc, cfg.Upstreams))
+		routes = append(routes, buildMatchedRoute(i, rc, "", cfg.Upstreams))
 	}
 	if len(routes) == 0 {
 		routes = append(routes, router.MatchedRoute{
@@ -162,7 +253,7 @@ func buildHostGroups(cfg *config.Config) []router.HostGroup {
 	return []router.HostGroup{{Match: "*", Routes: routes}}
 }
 
-func startServers(cfg *config.Config, rt *router.Router, cm *devtls.CertManager, sm *shutdown.Manager) map[int]*http.Server {
+func startServers(cfg *config.Config, rt *atomic.Pointer[router.Router], cm *devtls.CertManager, sm *shutdown.Manager) map[int]*http.Server {
 	servers := make(map[int]*http.Server)
 
 	for _, port := range cfg.Server.ListenPorts {
@@ -177,23 +268,23 @@ func startServers(cfg *config.Config, rt *router.Router, cm *devtls.CertManager,
 
 		if isTLS {
 			var cp *devtls.CertPair
-			var err error
+			var cerr error
 
 			if cfg.Server.TLS != nil && cfg.Server.TLS.CertFile != "" {
-				cp, err = cm.LoadFromDisk(cfg.Server.TLS.CertFile, cfg.Server.TLS.KeyFile)
-				if err != nil {
-					log.Fatalf("[dev-proxy] Failed to load certificate for port %d: %v", port, err)
+				cp, cerr = cm.LoadFromDisk(cfg.Server.TLS.CertFile, cfg.Server.TLS.KeyFile)
+				if cerr != nil {
+					log.Fatalf("[dev-proxy] Failed to load certificate for port %d: %v", port, cerr)
 				}
 			} else {
-				cp, err = cm.GetOrGenerate("server")
-				if err != nil {
-					log.Fatalf("[dev-proxy] Failed to generate self-signed certificate for port %d: %v", port, err)
+				cp, cerr = cm.GetOrGenerate("server")
+				if cerr != nil {
+					log.Fatalf("[dev-proxy] Failed to generate self-signed certificate for port %d: %v", port, cerr)
 				}
 			}
 			tlsCfg := &tls.Config{Certificates: []tls.Certificate{}}
-			cert, err := tls.X509KeyPair(cp.CertPEM, cp.KeyPEM)
-			if err != nil {
-				log.Fatalf("[dev-proxy] Failed to parse certificate for port %d: %v", port, err)
+			cert, cerr := tls.X509KeyPair(cp.CertPEM, cp.KeyPEM)
+			if cerr != nil {
+				log.Fatalf("[dev-proxy] Failed to parse certificate for port %d: %v", port, cerr)
 			}
 			tlsCfg.Certificates = append(tlsCfg.Certificates, cert)
 			srv.TLSConfig = tlsCfg
@@ -243,8 +334,7 @@ func handlePortError(port int, err error) {
 	log.Fatalf("[dev-proxy] FATAL: server on port %d error: %v", port, err)
 }
 
-// computeUpstreamURL reconstructs the URL that the proxy Director will forward
-// to, applying the same path-rewriting logic as proxy.NewReverseProxy.
+// computeUpstreamURL reconstructs the URL that the proxy Director will forward to.
 func computeUpstreamURL(route *router.MatchedRoute, reqPath string) string {
 	if route.UpstreamPath != "" {
 		suffix := strings.TrimPrefix(reqPath, route.PathPrefix)
@@ -256,8 +346,7 @@ func computeUpstreamURL(route *router.MatchedRoute, reqPath string) string {
 	return route.Upstream + reqPath
 }
 
-// routeCriterion returns a compact tag for the most-specific active path
-// criterion on a route: regex > exact > prefix > "*".
+// routeCriterion returns a compact tag for the most-specific active path criterion.
 func routeCriterion(route *router.MatchedRoute) string {
 	if route.PathRegex != nil {
 		return "regex:" + route.PathRegex.String()
@@ -271,10 +360,11 @@ func routeCriterion(route *router.MatchedRoute) string {
 	return "*"
 }
 
-func buildHandler(rt *router.Router, serverCfg *config.ServerConfig, isTLS bool) http.Handler {
+func buildHandler(rt *atomic.Pointer[router.Router], serverCfg *config.ServerConfig, isTLS bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		result := rt.Match(r)
+		// Load the current router atomically — safe under concurrent reloads.
+		result := rt.Load().Match(r)
 
 		if result == nil {
 			lw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusGatewayTimeout}

@@ -1,7 +1,6 @@
 package config
 
 import (
-	"flag"
 	"fmt"
 	"net/url"
 	"os"
@@ -47,9 +46,12 @@ type RouteConfig struct {
 
 // HostGroup groups routes under a host match pattern.
 // Entries are evaluated in declaration order — first match wins.
+// The optional Upstream field provides a default upstream for routes that
+// do not specify their own; route-level upstream always takes precedence.
 type HostGroup struct {
-	Match  string        `yaml:"match"`
-	Routes []RouteConfig `yaml:"routes"`
+	Match    string        `yaml:"match"`
+	Upstream string        `yaml:"upstream"`
+	Routes   []RouteConfig `yaml:"routes"`
 }
 
 // Config is the top-level YAML configuration.
@@ -62,32 +64,20 @@ type Config struct {
 	ConfigPath string                    `yaml:"-"`
 }
 
-// Load reads dev-proxy.yaml and applies CLI flags (which override).
-func Load() (*Config, error) {
-	configPath := "dev-proxy.yaml"
-	if p := os.Getenv("DEV_PROXY_CONFIG"); p != "" {
-		configPath = p
-	}
-
-	var configFlag string
-	flag.StringVar(&configFlag, "config", "", "Path to dev-proxy YAML config file (default: dev-proxy.yaml in cwd)")
-	flag.Parse()
-
-	if configFlag != "" {
-		configPath = configFlag
-	}
-
-	data, err := os.ReadFile(configPath)
+// Load reads the YAML config from the given path, parses, and validates it.
+// The caller is responsible for resolving the path (e.g. from CLI flags or env).
+func Load(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("config file not found: %s", configPath)
+			return nil, fmt.Errorf("config file not found: %s", path)
 		}
-		return nil, fmt.Errorf("read config file %s: %w", configPath, err)
+		return nil, fmt.Errorf("read config file %s: %w", path, err)
 	}
 
-	cfg := &Config{ConfigPath: configPath}
+	cfg := &Config{ConfigPath: path}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("parse config %s: %w", configPath, err)
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 
 	if err := validate(cfg); err != nil {
@@ -151,8 +141,20 @@ func validate(cfg *Config) error {
 		if len(hg.Routes) == 0 {
 			return fmt.Errorf("hosts[%d] (match=%q): routes must not be empty", i, hg.Match)
 		}
+		// Validate the host-level upstream if present.
+		if hg.Upstream != "" {
+			if strings.Contains(hg.Upstream, "://") {
+				if _, err := url.Parse(hg.Upstream); err != nil {
+					return fmt.Errorf("hosts[%d] (match=%q): invalid upstream URL %q: %w", i, hg.Match, hg.Upstream, err)
+				}
+			} else {
+				if _, ok := cfg.Upstreams[hg.Upstream]; !ok {
+					return fmt.Errorf("hosts[%d] (match=%q): upstream %q is not defined in the upstreams map", i, hg.Match, hg.Upstream)
+				}
+			}
+		}
 		for j, r := range hg.Routes {
-			if err := validateRoute(i*1000+j, r, cfg.Upstreams); err != nil {
+			if err := validateRoute(i*1000+j, r, hg.Upstream, cfg.Upstreams); err != nil {
 				return fmt.Errorf("hosts[%d].routes[%d]: %w", i, j, err)
 			}
 		}
@@ -165,7 +167,7 @@ func validate(cfg *Config) error {
 
 	// Validate flat routes.
 	for i, r := range cfg.Routes {
-		if err := validateRoute(i, r, cfg.Upstreams); err != nil {
+		if err := validateRoute(i, r, "", cfg.Upstreams); err != nil {
 			return fmt.Errorf("route %d: %w", i, err)
 		}
 	}
@@ -173,16 +175,22 @@ func validate(cfg *Config) error {
 	return nil
 }
 
-func validateRoute(idx int, r RouteConfig, upstreams map[string]UpstreamConfig) error {
-	if r.Upstream != "" {
-		if strings.Contains(r.Upstream, "://") {
-			if _, err := url.Parse(r.Upstream); err != nil {
-				return fmt.Errorf("invalid upstream URL %q: %w", r.Upstream, err)
-			}
-		} else {
-			if _, ok := upstreams[r.Upstream]; !ok {
-				return fmt.Errorf("upstream %q is not defined in the upstreams map", r.Upstream)
-			}
+func validateRoute(idx int, r RouteConfig, hostUpstream string, upstreams map[string]UpstreamConfig) error {
+	// Determine the effective upstream: route-level wins, then host-level fallback.
+	effective := r.Upstream
+	if effective == "" {
+		effective = hostUpstream
+	}
+	if effective == "" {
+		return fmt.Errorf("upstream must not be empty (no route-level upstream and no host-level upstream default)")
+	}
+	if strings.Contains(effective, "://") {
+		if _, err := url.Parse(effective); err != nil {
+			return fmt.Errorf("invalid upstream URL %q: %w", effective, err)
+		}
+	} else {
+		if _, ok := upstreams[effective]; !ok {
+			return fmt.Errorf("upstream %q is not defined in the upstreams map", effective)
 		}
 	}
 	return nil
