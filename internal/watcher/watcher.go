@@ -7,22 +7,24 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// Watcher watches a config file for changes and triggers a reload callback.
+// Watcher watches one or more files for changes and triggers a reload callback.
 type Watcher struct {
 	fsWatcher   *fsnotify.Watcher
-	filePath    string
+	filePaths   []string
 	reloadFunc  func() error
 	onReloadErr func(error) // called when reloadFunc returns an error
 	onFSErr     func(error) // called when fsnotify reports an internal error
 	mu          sync.Mutex
 }
 
-// New creates a new Watcher.
+// New creates a new Watcher that monitors all paths in filePaths.
+// Paths that do not exist at the time Start is called are silently skipped —
+// this allows an optional .env file to be listed without requiring it to exist.
 // onReloadErr is called (if non-nil) when reloadFunc returns an error.
 // onFSErr is called (if non-nil) when the underlying fsnotify watcher reports an error.
-func New(filePath string, reloadFunc func() error, onReloadErr func(error), onFSErr func(error)) (*Watcher, error) {
+func New(filePaths []string, reloadFunc func() error, onReloadErr func(error), onFSErr func(error)) (*Watcher, error) {
 	w := &Watcher{
-		filePath:    filePath,
+		filePaths:   filePaths,
 		reloadFunc:  reloadFunc,
 		onReloadErr: onReloadErr,
 		onFSErr:     onFSErr,
@@ -37,15 +39,29 @@ func New(filePath string, reloadFunc func() error, onReloadErr func(error), onFS
 	return w, nil
 }
 
-// Start begins watching the config file for changes.
+// Start begins watching all configured file paths for changes.
+// Paths that do not exist are silently skipped (no error).
 func (w *Watcher) Start() error {
-	path := w.filePath
-	if path == "" {
-		path = "dev-proxy.yaml"
+	if len(w.filePaths) == 0 {
+		return fmt.Errorf("no file paths to watch")
 	}
 
-	if err := w.fsWatcher.Add(path); err != nil {
-		return fmt.Errorf("add watch for %s: %w", path, err)
+	watched := 0
+	for _, path := range w.filePaths {
+		if path == "" {
+			continue
+		}
+		if err := w.fsWatcher.Add(path); err != nil {
+			// Skip missing files silently — .env may not exist.
+			continue
+		}
+		watched++
+	}
+
+	if watched == 0 {
+		// Nothing to watch — still valid (e.g. all paths missing), but log-worthy.
+		// Caller decides whether to treat this as an error; we return nil.
+		return nil
 	}
 
 	go w.watchLoop()

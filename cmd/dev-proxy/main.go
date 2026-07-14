@@ -32,9 +32,18 @@ func main() {
 		configPath = p
 	}
 	flag.StringVar(&configPath, "config", configPath, "Path to dev-proxy YAML config file")
+
+	// Resolve env file path — defaults to .env in CWD.
+	// DEV_PROXY_ENV_FILE env var mirrors the --env-file flag convention.
+	envPath := ".env"
+	if p := os.Getenv("DEV_PROXY_ENV_FILE"); p != "" {
+		envPath = p
+	}
+	flag.StringVar(&envPath, "env-file", envPath, "Path to .env file for config variable interpolation (default \".env\")")
+
 	flag.Parse()
 
-	cfg, err := config.Load(configPath)
+	cfg, err := config.Load(configPath, envPath)
 	if err != nil {
 		log.Fatalf("[dev-proxy] Failed to load configuration: %v", err)
 	}
@@ -62,9 +71,9 @@ func main() {
 	logStartupInfo(cfg, groups)
 
 	w, err := watcher.New(
-		configPath,
+		[]string{configPath, envPath},
 		func() error {
-			newCfg, err := config.Load(configPath)
+			newCfg, err := config.Load(configPath, envPath)
 			if err != nil {
 				logger.Error("config reload failed: %v", err)
 				return err

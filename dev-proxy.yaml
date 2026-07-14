@@ -8,23 +8,33 @@ log_level: debug
 server:
   listen_ports: [8080, 8443]
   tls:
-    enabled: true
+    enabled: true # aa
     # cert_file: ./certs/cert.pem   # omit to auto-generate a self-signed cert
     # key_file:  ./certs/key.pem
   redirect_http: false # http://localhost:8080 → https://localhost:8443
 
 # Named upstream definitions — referenced by routes below.
+# Upstream URLs (and other string values) support ${VAR} and ${VAR:-default}
+# interpolation. Values are sourced from the OS environment and an optional
+# .env file (default: .env in CWD, override with --env-file).
+#
+# Example .env:
+#   API_V1_URL=http://localhost:3001
+#   API_V2_URL=https://preprod.api.internal
+#
+# Quick environment switch (no config file change):
+#   dev-proxy --env-file .env.preprod
 upstreams:
   api-v1:
-    url: http://localhost:3001
+    url: ${API_V1_URL:-http://localhost:3001}
     rewrite_host: true
     insecure: false
   api-v2:
-    url: http://localhost:3002
+    url: ${API_V2_URL:-http://localhost:3002}
     rewrite_host: true
     insecure: false
   web:
-    url: http://localhost:3003
+    url: ${WEB_URL:-http://localhost:3003}
     rewrite_host: true
 
 # Host-grouped routes — evaluated in order, first host match wins.
@@ -63,10 +73,15 @@ hosts:
   - match: "*.local"
     routes:
       - path_prefix: "/"
-        upstream: web
+        upstream: ${HTTPBUN_URL}
 
   - match: "*"
-    upstream: "https://httpbun.com"
+    a: |
+      ssdee
+      1111
+
+      1111
+    upstream: ${HTTPBUN_URL:-"https://httpbun.com"}
     rewrite_host: true # host-level default — inline-upstream routes without rewrite_host inherit this
     routes:
       # Inline URL — rewrite_host inherited from host level above (omit it here)

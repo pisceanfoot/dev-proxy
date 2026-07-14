@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -81,20 +82,51 @@ type Config struct {
 	ConfigPath string                    `yaml:"-"`
 }
 
+func printMapDebug(m map[string]string) {
+    keys := make([]string, 0, len(m))
+    for k := range m {
+        keys = append(keys, k)
+    }
+    sort.Strings(keys)
+
+    fmt.Println("[")
+    for _, k := range keys {
+        fmt.Printf("  %q: %q,\n", k, m[k])
+    }
+    fmt.Println("]")
+}
+
 // Load reads the YAML config from the given path, parses, and validates it.
-// The caller is responsible for resolving the path (e.g. from CLI flags or env).
-func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+// envPath is the path to an optional .env file; if empty or the file does not
+// exist the proxy starts without it, using only the OS environment for any
+// ${VAR} / ${VAR:-default} interpolation tokens found in the YAML.
+func Load(configPath, envPath string) (*Config, error) {
+	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("config file not found: %s", path)
+			return nil, fmt.Errorf("config file not found: %s", configPath)
 		}
-		return nil, fmt.Errorf("read config file %s: %w", path, err)
+		return nil, fmt.Errorf("read config file %s: %w", configPath, err)
 	}
 
-	cfg := &Config{ConfigPath: path}
+	
+
+	// Load .env file (missing file is not an error).
+	dotEnv, err := parseDotEnv(envPath)
+	if err != nil {
+		return nil, fmt.Errorf("load env file: %w", err)
+	}
+
+	// Expand ${VAR} / ${VAR:-default} tokens before YAML parsing.
+	env := mergeEnv(dotEnv)
+	data, err = expandVars(data, env)
+	if err != nil {
+		return nil, fmt.Errorf("expand config vars: %w", err)
+	}
+
+	cfg := &Config{ConfigPath: configPath}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("parse config %s: %w", path, err)
+		return nil, fmt.Errorf("parse config %s: %w", configPath, err)
 	}
 
 	if err := validate(cfg); err != nil {
