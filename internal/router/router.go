@@ -16,19 +16,21 @@ type CORSConfig struct {
 
 // MatchedRoute is the result of matching a request against the route table.
 type MatchedRoute struct {
-	LocalPort    int
-	PathPrefix   string
-	PathExact    string
-	PathRegex    *regexp.Regexp
-	HostMatch    string
-	Upstream     string
-	UpstreamPath string
-	RewriteHost  bool
-	CORS         *CORSConfig
-	StaticDir    string
-	ReviewMode   bool
-	Insecure     bool
-	TLSEnabled   bool
+	LocalPort          int
+	PathPrefix         string
+	PathExact          string
+	PathRegex          *regexp.Regexp
+	HostMatch          string
+	Upstream           string
+	UpstreamPath       string
+	URLRewriteRegex    *regexp.Regexp
+	URLRewriteReplace  string
+	RewriteHost        bool
+	CORS               *CORSConfig
+	StaticDir          string
+	ReviewMode         bool
+	Insecure           bool
+	TLSEnabled         bool
 }
 
 // HostGroup is an ordered set of routes behind a host glob pattern.

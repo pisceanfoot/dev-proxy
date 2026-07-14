@@ -248,6 +248,16 @@ func buildMatchedRoute(i int, rc config.RouteConfig, hostUpstream string, hostRe
 		mr.PathRegex = re
 	}
 
+	if rc.URLRewrite != nil {
+		re, err := regexp.Compile(rc.URLRewrite.Match)
+		if err != nil {
+			// Should not happen — config validation already compiled the pattern.
+			log.Fatalf("[dev-proxy] route %d: invalid url_rewrite.match %q: %v", i, rc.URLRewrite.Match, err)
+		}
+		mr.URLRewriteRegex = re
+		mr.URLRewriteReplace = rc.URLRewrite.Replace
+	}
+
 	return mr
 }
 
@@ -371,6 +381,9 @@ func computeUpstreamURL(route *router.MatchedRoute, reqPath string) string {
 		}
 		return route.Upstream + route.UpstreamPath + suffix
 	}
+	if route.URLRewriteRegex != nil {
+		return route.Upstream + route.URLRewriteRegex.ReplaceAllString(reqPath, route.URLRewriteReplace)
+	}
 	return route.Upstream + reqPath
 }
 
@@ -412,6 +425,21 @@ func buildHandler(rt *atomic.Pointer[router.Router], serverCfg *config.ServerCon
 				log.Fatalf("Failed to create reverse proxy for upstream %s: %v", route.Upstream, err)
 			}
 			handler = rp
+
+			// Apply URL rewrite as a middleware in the dev-proxy handler layer,
+			// not inside the proxy package. Clone the request so the original
+			// r.URL.Path is preserved for the logging middleware above.
+			if route.URLRewriteRegex != nil {
+				rewriteRegex := route.URLRewriteRegex
+				rewriteReplace := route.URLRewriteReplace
+				inner := handler
+				handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					r2 := r.Clone(r.Context())
+					r2.URL.Path = rewriteRegex.ReplaceAllString(r.URL.Path, rewriteReplace)
+					r2.URL.RawPath = ""
+					inner.ServeHTTP(w, r2)
+				})
+			}
 		} else if route.StaticDir != "" {
 			handler = http.NotFoundHandler()
 		}

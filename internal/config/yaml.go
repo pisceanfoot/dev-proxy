@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -30,20 +31,28 @@ type UpstreamConfig struct {
 	Insecure    bool   `yaml:"insecure"`
 }
 
+// URLRewriteConfig holds the regex match/replace pair for URL path rewriting.
+// Both fields are required when url_rewrite is present on a route.
+type URLRewriteConfig struct {
+	Match   string `yaml:"match"`
+	Replace string `yaml:"replace"`
+}
+
 // RouteConfig is a pure proxy rule — no port or TLS fields.
 // RewriteHost is a pointer so that omitting the field in YAML ("not set / inherit
 // from host group") is distinguishable from explicitly writing rewrite_host: false.
 type RouteConfig struct {
-	PathPrefix      string `yaml:"path_prefix"`
-	PathExact       string `yaml:"path_exact"`
-	PathRegex       string `yaml:"path_regex"`
-	HostMatch       string `yaml:"host_match"`
-	Upstream        string `yaml:"upstream"`
-	UpstreamPath    string `yaml:"upstream_path"`
-	RewriteHost     *bool  `yaml:"rewrite_host"`
-	CORSAllowOrigin string `yaml:"cors_allow_origin"`
-	StaticDir       string `yaml:"static_dir"`
-	Insecure        bool   `yaml:"insecure"`
+	PathPrefix      string            `yaml:"path_prefix"`
+	PathExact       string            `yaml:"path_exact"`
+	PathRegex       string            `yaml:"path_regex"`
+	HostMatch       string            `yaml:"host_match"`
+	Upstream        string            `yaml:"upstream"`
+	UpstreamPath    string            `yaml:"upstream_path"`
+	URLRewrite      *URLRewriteConfig `yaml:"url_rewrite"`
+	RewriteHost     *bool             `yaml:"rewrite_host"`
+	CORSAllowOrigin string            `yaml:"cors_allow_origin"`
+	StaticDir       string            `yaml:"static_dir"`
+	Insecure        bool              `yaml:"insecure"`
 }
 
 // HostGroup groups routes under a host match pattern.
@@ -201,5 +210,22 @@ func validateRoute(idx int, r RouteConfig, hostUpstream string, upstreams map[st
 			return fmt.Errorf("upstream %q is not defined in the upstreams map", effective)
 		}
 	}
+
+	// Validate url_rewrite when present.
+	if r.URLRewrite != nil {
+		if r.UpstreamPath != "" {
+			return fmt.Errorf("url_rewrite and upstream_path are mutually exclusive on a route")
+		}
+		if r.URLRewrite.Match == "" {
+			return fmt.Errorf("url_rewrite.match must not be empty")
+		}
+		if r.URLRewrite.Replace == "" {
+			return fmt.Errorf("url_rewrite.replace must not be empty")
+		}
+		if _, err := regexp.Compile(r.URLRewrite.Match); err != nil {
+			return fmt.Errorf("url_rewrite.match %q is not a valid regexp: %w", r.URLRewrite.Match, err)
+		}
+	}
+
 	return nil
 }

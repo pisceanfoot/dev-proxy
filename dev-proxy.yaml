@@ -42,6 +42,15 @@ hosts:
         # inherits upstream: api-v1 from host
         upstream_path: "/v1" # /api/v1/users → forwarded as /v1/users
 
+      # url_rewrite example — regex capture groups rewrite the path dynamically.
+      # Incoming /api/v2/users → upstream receives /v2/users (capture group $1).
+      # url_rewrite and upstream_path are mutually exclusive on a route.
+      # - path_prefix: "/api/v2"
+      #   upstream: api-v2
+      #   url_rewrite:
+      #     match: "^/api/v2/(.*)"
+      #     replace: "/v2/$1"
+
       # Prefix path — /api/v2/... forwards to api-v2 (overrides host default)
       - path_prefix: "/api/v2"
         upstream: api-v2 # overrides host-level default
@@ -63,3 +72,6 @@ hosts:
       # Inline URL — rewrite_host inherited from host level above (omit it here)
       - path_prefix: "/"
         cors_allow_origin: "*"
+        url_rewrite:
+          match: "^/get/api/v2/(.*)"
+          replace: "/any/v2/$1"
