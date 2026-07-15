@@ -2,32 +2,53 @@ package watcher
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
 
-// Watcher watches one or more files for changes and triggers a reload callback.
-type Watcher struct {
-	fsWatcher   *fsnotify.Watcher
-	filePaths   []string
-	reloadFunc  func() error
-	onReloadErr func(error) // called when reloadFunc returns an error
-	onFSErr     func(error) // called when fsnotify reports an internal error
-	mu          sync.Mutex
+// isAuxFile returns true if the event targets a Vim/Editor auxiliary file.
+func isAuxFile(path string) bool {
+	base := filepath.Base(path)
+	return base == ".DS_Store" ||
+		(base != "." && (base[0] == '.' && len(base) > 4 && base[len(base)-4:] == ".swp")) || // .file.swp
+		(base != "." && (base[0] == '.' && len(base) > 4 && base[len(base)-4:] == ".swo")) || // .file.swo
+		base == "*.bak" ||
+		(len(base) > 1 && base[len(base)-1] == '~')
 }
 
-// New creates a new Watcher that monitors all paths in filePaths.
-// Paths that do not exist at the time Start is called are silently skipped —
-// this allows an optional .env file to be listed without requiring it to exist.
-// onReloadErr is called (if non-nil) when reloadFunc returns an error.
-// onFSErr is called (if non-nil) when the underlying fsnotify watcher reports an error.
+type Watcher struct {
+	fsWatcher   *fsnotify.Watcher
+	filePaths   map[string]bool // map for fast lookup of target files
+	reloadFunc  func() error
+	onReloadErr func(error)
+	onFSErr     func(error)
+	mu          sync.Mutex
+
+	// Track last known modification time per watched path to avoid false reloads.
+	lastMtime map[string]time.Time
+}
+
 func New(filePaths []string, reloadFunc func() error, onReloadErr func(error), onFSErr func(error)) (*Watcher, error) {
+	// Clean and absolute-ify files to ensure robust matching
+	targets := make(map[string]bool)
+	for _, p := range filePaths {
+		if abs, err := filepath.Abs(p); err == nil {
+			targets[abs] = true
+		} else {
+			targets[filepath.Clean(p)] = true
+		}
+	}
+
 	w := &Watcher{
-		filePaths:   filePaths,
+		filePaths:   targets,
 		reloadFunc:  reloadFunc,
 		onReloadErr: onReloadErr,
 		onFSErr:     onFSErr,
+		lastMtime:   make(map[string]time.Time),
 	}
 
 	fw, err := fsnotify.NewWatcher()
@@ -35,33 +56,27 @@ func New(filePaths []string, reloadFunc func() error, onReloadErr func(error), o
 		return nil, fmt.Errorf("create watcher: %w", err)
 	}
 	w.fsWatcher = fw
-
 	return w, nil
 }
 
-// Start begins watching all configured file paths for changes.
-// Paths that do not exist are silently skipped (no error).
 func (w *Watcher) Start() error {
 	if len(w.filePaths) == 0 {
 		return fmt.Errorf("no file paths to watch")
 	}
 
-	watched := 0
-	for _, path := range w.filePaths {
-		if path == "" {
+	// Watch the parent directories of our targets instead of the files directly
+	watchedDirs := make(map[string]bool)
+	for path := range w.filePaths {
+		if path == "" || isAuxFile(path) {
 			continue
 		}
-		if err := w.fsWatcher.Add(path); err != nil {
-			// Skip missing files silently — .env may not exist.
-			continue
+		dir := filepath.Dir(path)
+		if !watchedDirs[dir] {
+			if err := w.fsWatcher.Add(dir); err != nil {
+				continue // skip missing directories silently
+			}
+			watchedDirs[dir] = true
 		}
-		watched++
-	}
-
-	if watched == 0 {
-		// Nothing to watch — still valid (e.g. all paths missing), but log-worthy.
-		// Caller decides whether to treat this as an error; we return nil.
-		return nil
 	}
 
 	go w.watchLoop()
@@ -69,19 +84,69 @@ func (w *Watcher) Start() error {
 }
 
 func (w *Watcher) watchLoop() {
+	const debounce = 100 * time.Millisecond
+	// Use a channel-based debouncer approach instead of fighting the Timer directly
+	var timerChan <-chan time.Time
+	var pendingReload bool
+
 	for {
 		select {
 		case event, ok := <-w.fsWatcher.Events:
 			if !ok {
 				return
 			}
-			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
-				if err := w.reloadFunc(); err != nil {
-					if w.onReloadErr != nil {
-						w.onReloadErr(err)
-					}
+
+			// 1. Ensure the event targets one of our specific target files
+			absEventPath, err := filepath.Abs(event.Name)
+			if err != nil {
+				absEventPath = filepath.Clean(event.Name)
+			}
+			if !w.filePaths[absEventPath] {
+				continue
+			}
+
+			// 2. Skip auxiliary swap/temp files
+			if isAuxFile(event.Name) {
+				continue
+			}
+
+			// 3. Since Vim deletes/re-creates, we want to capture Writes, Creates,
+			// or Chmod events (which often happen at the end of a rename sequence)
+			isWriteOp := event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Chmod)
+			if !isWriteOp {
+				continue
+			}
+
+			// 4. Verify file exists and modified time changed
+			info, err := os.Stat(event.Name)
+			if err != nil || info.IsDir() {
+				continue
+			}
+
+			w.mu.Lock()
+			prev, exists := w.lastMtime[absEventPath]
+			mtime := info.ModTime()
+			changedContent := !exists || !prev.Equal(mtime)
+			if changedContent {
+				w.lastMtime[absEventPath] = mtime
+			}
+			w.mu.Unlock()
+
+			// 5. Trigger debounce if the content actually changed
+			if changedContent {
+				pendingReload = true
+				timerChan = time.After(debounce)
+			}
+
+		case <-timerChan:
+			// Debounce finished - trigger the reload!
+			if pendingReload {
+				pendingReload = false
+				if err := w.reloadFunc(); err != nil && w.onReloadErr != nil {
+					w.onReloadErr(err)
 				}
 			}
+
 		case err, ok := <-w.fsWatcher.Errors:
 			if !ok {
 				return
@@ -93,7 +158,6 @@ func (w *Watcher) watchLoop() {
 	}
 }
 
-// Close stops the watcher and releases resources.
 func (w *Watcher) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()

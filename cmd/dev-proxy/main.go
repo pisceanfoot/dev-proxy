@@ -16,12 +16,12 @@ import (
 
 	"dev-proxy/internal/config"
 	"dev-proxy/internal/cors"
-	devtls "dev-proxy/internal/tls"
 	"dev-proxy/internal/logger"
 	"dev-proxy/internal/proxy"
 	"dev-proxy/internal/router"
 	"dev-proxy/internal/shutdown"
 	"dev-proxy/internal/static"
+	devtls "dev-proxy/internal/tls"
 	"dev-proxy/internal/watcher"
 )
 
@@ -73,6 +73,7 @@ func main() {
 	w, err := watcher.New(
 		[]string{configPath, envPath},
 		func() error {
+			logger.Info("[dev-proxy] config change detected, reloading...")
 			newCfg, err := config.Load(configPath, envPath)
 			if err != nil {
 				logger.Error("config reload failed: %v", err)
