@@ -95,9 +95,6 @@ func (r *Router) Match(req *http.Request) *MatchResult {
 
 			return &MatchResult{HostGroupPattern: group.Match, Route: rt}
 		}
-
-		// Host matched but no path matched — 504, no fall-through.
-		return nil
 	}
 	return nil
 }

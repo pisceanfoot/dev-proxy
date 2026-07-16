@@ -127,11 +127,11 @@ server:
 
 Named upstream definitions referenced by routes below. Each entry has a key (the name) and configuration.
 
-| Field          | Default      | Description                                                                                                                      |
-| -------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------- |
-| `url`          | _(required)_ | Base URL of the upstream service. Supports `${VAR}` and `${VAR:-default}` interpolation from `.env` or OS environment variables. |
-| `rewrite_host` | —            | If `true`, sets the `Host` header on proxied requests to match the inbound host.                                                 |
-| `insecure`     | `false`      | If `true`, skips TLS certificate verification for HTTPS upstreams.                                                               |
+| Field          | Default       | Description                                                                                                                      |
+| -------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `url`          | _(required)_  | Base URL of the upstream service. Supports `${VAR}` and `${VAR:-default}` interpolation from `.env` or OS environment variables. |
+| `rewrite_host` | default(true) | If `true`, sets the `Host` header on proxied requests to match the inbound host.                                                 |
+| `insecure`     | `false`       | If `true`, skips TLS certificate verification for HTTPS upstreams.                                                               |
 
 ```yaml
 upstreams:

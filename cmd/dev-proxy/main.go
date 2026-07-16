@@ -225,11 +225,11 @@ func buildMatchedRoute(i int, rc config.RouteConfig, hostUpstream string, hostRe
 	}
 
 	// Resolve effective rewrite_host for inline-upstream routes:
-	//   route-level ptr → host-level ptr → false.
+	//   route-level ptr → host-level ptr → true.
 	// Named-upstream routes get rewrite_host from the upstream definition
 	// (handled inside resolveUpstream), so we only apply inheritance here.
 	if rc.RewriteHost == nil {
-		effectiveRewriteHost := false
+		effectiveRewriteHost := true
 		if hostRewriteHost != nil {
 			effectiveRewriteHost = *hostRewriteHost
 		}
@@ -444,10 +444,9 @@ func buildHandler(rt *atomic.Pointer[router.Router], serverCfg *config.ServerCon
 				rewriteReplace := route.URLRewriteReplace
 				inner := handler
 				handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					r2 := r.Clone(r.Context())
-					r2.URL.Path = rewriteRegex.ReplaceAllString(r.URL.Path, rewriteReplace)
-					r2.URL.RawPath = ""
-					inner.ServeHTTP(w, r2)
+					r.URL.Path = rewriteRegex.ReplaceAllString(r.URL.Path, rewriteReplace)
+					r.URL.RawPath = ""
+					inner.ServeHTTP(w, r)
 				})
 			}
 		} else if route.StaticDir != "" {
