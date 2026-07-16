@@ -27,15 +27,12 @@ server:
 upstreams:
   api-v1:
     url: ${API_V1_URL:-http://localhost:3001}
-    rewrite_host: true
     insecure: false
   api-v2:
     url: ${API_V2_URL:-http://localhost:3002}
-    rewrite_host: true
     insecure: false
   web:
     url: ${WEB_URL:-http://localhost:3003}
-    rewrite_host: true
 
 # Host-grouped routes — evaluated in order, first host match wins.
 # Within a group, first path match wins. No fall-through between groups.
@@ -73,7 +70,7 @@ hosts:
   - match: "*.local"
     routes:
       - path_prefix: "/"
-        upstream: ${HTTPBUN_URL}
+        upstream: ${HTTPBUN_URL:-"https://httpbun.com"} # host-level default — inline-upstream routes without rewrite_host inherit this
 
   - match: "*"
     a: |
@@ -81,8 +78,7 @@ hosts:
       1111
 
       1111
-    upstream: ${HTTPBUN_URL:-"https://httpbun.com"}
-    rewrite_host: true # host-level default — inline-upstream routes without rewrite_host inherit this
+    upstream: ${HTTPBUN_URL:-"https://httpbun.com"} # host-level default — inline-upstream routes without rewrite_host inherit this
     routes:
       # Inline URL — rewrite_host inherited from host level above (omit it here)
       - path_prefix: "/"
