@@ -95,6 +95,8 @@ func (r *Router) Match(req *http.Request) *MatchResult {
 
 			return &MatchResult{HostGroupPattern: group.Match, Route: rt}
 		}
+
+		return nil // host matched but no path matched
 	}
 	return nil
 }
