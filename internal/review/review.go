@@ -143,6 +143,6 @@ func CloneRequest(req *http.Request) (*http.Request, []byte, error) {
 		req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 	}
 
-	cloned := req.Clone(nil)
+	cloned := req.Clone(req.Context())
 	return cloned, bodyBytes, nil
 }
