@@ -10,7 +10,7 @@ import (
 )
 
 func TestNewReverseProxy_InvalidURL(t *testing.T) {
-	_, err := NewReverseProxy("://invalid-url", false, false, "", "")
+	_, err := NewReverseProxy("://invalid-url", false, "", "")
 	if err == nil {
 		t.Fatal("expected error for invalid URL, got nil")
 	}
@@ -23,7 +23,7 @@ func TestNewReverseProxy_ValidUpstream(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	proxy, err := NewReverseProxy(upstream.URL, false, false, "", "")
+	proxy, err := NewReverseProxy(upstream.URL, false, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -40,41 +40,20 @@ func TestNewReverseProxy_RewriteHost(t *testing.T) {
 
 	proxyURL, _ := url.Parse(upstream.URL)
 
-	t.Run("rewriteHost=true", func(t *testing.T) {
-		proxy, err := NewReverseProxy(upstream.URL, true, false, "", "")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+	proxy, err := NewReverseProxy(upstream.URL, false, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		req.Host = "original-host"
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "original-host"
 
-		// Use the proxy's Director directly to test host rewriting
-		proxy.Director(req)
+	// Use the proxy's Director directly to test host rewriting
+	proxy.Director(req)
 
-		if req.Host != proxyURL.Host {
-			t.Fatalf("expected Host=%q, got %q", proxyURL.Host, req.Host)
-		}
-	})
-
-	t.Run("rewriteHost=false", func(t *testing.T) {
-		proxy, err := NewReverseProxy(upstream.URL, false, false, "", "")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		req.Host = "original-host"
-
-		proxy.Director(req)
-
-		// When rewriteHost is false, the custom Director still delegates to the
-		// original director which sets the URL host; req.Host behavior depends
-		// on Go version. We just verify it doesn't panic and URL is updated.
-		if req.URL.Host != proxyURL.Host {
-			t.Fatalf("expected URL.Host=%q, got %q", proxyURL.Host, req.URL.Host)
-		}
-	})
+	if req.Host != proxyURL.Host {
+		t.Fatalf("expected Host=%q, got %q", proxyURL.Host, req.Host)
+	}
 }
 
 func TestNewReverseProxy_InsecureHTTPS(t *testing.T) {
@@ -83,7 +62,7 @@ func TestNewReverseProxy_InsecureHTTPS(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	proxy, err := NewReverseProxy(upstream.URL, false, true, "", "")
+	proxy, err := NewReverseProxy(upstream.URL, true, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -138,7 +117,7 @@ func TestNewReverseProxy_PathRewriting(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 			defer upstream.Close()
 
-			proxy, err := NewReverseProxy(upstream.URL, false, false, tt.routePrefix, tt.upstreamPath)
+			proxy, err := NewReverseProxy(upstream.URL, false, tt.routePrefix, tt.upstreamPath)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -160,7 +139,7 @@ func TestServeHTTP(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	proxy, err := NewReverseProxy(upstream.URL, false, false, "", "")
+	proxy, err := NewReverseProxy(upstream.URL, false, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -188,7 +167,7 @@ func TestServeHTTP_WithPathPrefix(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	proxy, err := NewReverseProxy(upstream.URL, false, false, "/api", "/v1")
+	proxy, err := NewReverseProxy(upstream.URL, false, "/api", "/v1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

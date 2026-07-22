@@ -70,7 +70,7 @@ hosts:
   - match: "*.local"
     routes:
       - path_prefix: "/"
-        upstream: ${HTTPBUN_URL:-"https://httpbun.com"} # host-level default — inline-upstream routes without rewrite_host inherit this
+        upstream: ${HTTPBUN_URL:-"https://httpbun.com"}
 
   - match: "*"
     a: |
@@ -78,9 +78,8 @@ hosts:
       1111
 
       1111
-    upstream: ${HTTPBUN_URL:-"https://httpbun.com"} # host-level default — inline-upstream routes without rewrite_host inherit this
+    upstream: ${HTTPBUN_URL:-"https://httpbun.com"}
     routes:
-      # Inline URL — rewrite_host inherited from host level above (omit it here)
       - path_prefix: "/"
         cors_allow_origin: "*"
         url_rewrite:

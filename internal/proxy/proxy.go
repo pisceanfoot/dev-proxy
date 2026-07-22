@@ -8,11 +8,11 @@ import (
 )
 
 // NewReverseProxy creates an httputil.ReverseProxy for the given upstream URL.
-// If rewriteHost is true, the outgoing Host header will be set to the upstream hostname.
+// The outgoing Host header is always set to the upstream hostname.
 // If insecure is true, TLS verification against the upstream is skipped.
 // If upstreamPath is non-empty, the forwarded path is rewritten: routePrefix is stripped
 // from the request path and upstreamPath is prepended to the remainder.
-func NewReverseProxy(upstream string, rewriteHost bool, insecure bool, routePrefix string, upstreamPath string) (*httputil.ReverseProxy, error) {
+func NewReverseProxy(upstream string, insecure bool, routePrefix string, upstreamPath string) (*httputil.ReverseProxy, error) {
 	u, err := url.Parse(upstream)
 	if err != nil {
 		return nil, err
@@ -30,7 +30,7 @@ func NewReverseProxy(upstream string, rewriteHost bool, insecure bool, routePref
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
-		if rewriteHost && u.Host != "" {
+		if u.Host != "" {
 			req.Host = u.Host
 		}
 		if upstreamPath != "" {
